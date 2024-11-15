@@ -1,0 +1,70 @@
+WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
+
+query = { SOI ~ expression ~ sort_clause? ~ EOI }
+
+identifier = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+keyword = @{ ^"AND" | ^"OR" | ^"NOT" | ^"count" | ^"exists" }
+
+operator = _{ op_equal | op_gte | op_lte | op_gt | op_lt }
+	op_equal = { "=" }
+	op_gt = { ">" }
+	op_lt = { "<" }
+	op_gte = { ">=" }
+	op_lte = { "<=" }
+
+function_name = @{ ^"exists" }
+
+number = @{
+	"-"? ~
+	ASCII_DIGIT+ ~
+	("." ~ ASCII_DIGIT+)? ~
+	("e" ~ ("+" | "-")? ~ ASCII_DIGIT+)?
+}
+
+string = { double_quote ~ double_string ~ double_quote | single_quote ~ single_string ~ single_quote }
+	double_string = @{ (raw_string | escape_string)* }
+	single_string = @{ (raw_single_string | escape_string)* }
+	raw_string = @{ (!("\\" | "\"") ~ ANY)+ }
+	raw_single_string = @{ (!("\\" | "'") ~ ANY)+ }
+	escape_string = @{ "\\" ~ ("\"" | "'" | "\\" | "n" | "r" | "t") }
+	double_quote = _{ "\"" }
+	single_quote = _{ "'" }
+
+LPAREN = _{ "(" }
+
+RPAREN = _{ ")" }
+
+COMMA = _{ "," }
+
+COLON = _{ ":" }
+
+NOT = { ^"NOT" }
+
+expression = { and_expression ~ (^"OR" ~ and_expression)* }
+
+and_expression = { not_expression ~ (^"AND" ~ not_expression)* }
+
+not_expression = { NOT? ~ primary }
+
+primary = { LPAREN ~ expression ~ RPAREN | predicate }
+
+predicate = { comparison | function_call }
+
+comparison = { operand ~ operator ~ value }
+
+operand = { function_call | identifier }
+
+function_call = { function_name ~ LPAREN ~ identifier ~ RPAREN }
+
+value = { number | string }
+
+ASCII_ALPHA = _{ 'a'..'z' | 'A'..'Z' }
+
+ASCII_DIGIT = _{ '0'..'9' }
+
+ASCII_ALPHANUMERIC = _{ ASCII_ALPHA | ASCII_DIGIT }
+
+COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
+
+sort_clause = { ^"sort" ~ COLON ~ identifier }
