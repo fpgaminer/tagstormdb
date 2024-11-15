@@ -3,13 +3,12 @@ mod server_error;
 mod tags;
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
-	path::{Path, PathBuf},
-	sync::Arc,
+	collections::{BTreeMap, BTreeSet, HashMap}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, sync::Arc
 };
 
 use actix_cors::Cors;
 use actix_files::NamedFile;
+use actix_multipart::form::{tempfile::TempFileConfig, MultipartForm};
 use actix_web::{
 	body::MessageBody,
 	dev::{ServiceFactory, ServiceRequest, ServiceResponse},
@@ -35,6 +34,9 @@ use tagstormdb::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 
+const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+
+
 #[derive(Parser, Debug)]
 #[command()]
 struct Args {
@@ -50,6 +52,10 @@ struct Args {
 	#[arg(long, default_value = "images")]
 	image_dir: PathBuf,
 
+	/// Path to the upload directory.
+	#[arg(long, default_value = "upload")]
+	upload_dir: PathBuf,
+
 	/// Path to the database directory.
 	#[arg(long, default_value = "db")]
 	db_dir: PathBuf,
@@ -59,6 +65,7 @@ struct Args {
 #[derive(Clone)]
 struct ServerData {
 	image_dir: PathBuf,
+	upload_dir: PathBuf,
 	server_secret: [u8; 32],
 }
 
@@ -83,6 +90,7 @@ async fn main() -> Result<(), anyhow::Error> {
 	// Setup HTTP server
 	let server_data = ServerData {
 		image_dir: args.image_dir,
+		upload_dir: args.upload_dir,
 		server_secret,
 	};
 
@@ -136,6 +144,8 @@ fn build_app(
 		.max_age(3600);
 
 	let tag_mappings = Data::new(tag_mappings);
+	// Ensure temporary upload files end up in our upload directory, so we can atomically move them
+	let temp_file_config = TempFileConfig::default().directory(&server_data.upload_dir);
 
 	App::new()
 		.wrap(logger)
@@ -144,6 +154,7 @@ fn build_app(
 		.app_data(Data::new(db))
 		.app_data(tag_mappings)
 		.app_data(Data::new(server_data))
+		.app_data(temp_file_config)
 		.service(get_tag_mappings)
 		.service(list_tags)
 		.service(add_tag)
@@ -164,6 +175,8 @@ fn build_app(
 		.service(list_user_tokens)
 		.service(change_user_scopes)
 		.service(search_images)
+		.service(upload_image)
+		.service(imgops_upload)
 }
 
 
@@ -377,7 +390,7 @@ async fn add_image(
 	let image_path = server_data.image_dir.join(&hash_str[0..2]).join(&hash_str[2..4]).join(&hash_str);
 
 	// Check if the image exists
-	if !image_path.exists() {
+	if !tokio::fs::try_exists(&image_path).await.context("Failed to check if image exists")? {
 		return Ok(HttpResponse::NotFound().body("Image not found"));
 	}
 
@@ -843,9 +856,127 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 }
 
 
+#[derive(Debug, MultipartForm)]
+struct UploadImageForm {
+	#[multipart(rename = "file")]
+	files: Vec<actix_multipart::form::tempfile::TempFile>,
+}
+
+#[actix_web::post("/upload_image")]
+async fn upload_image(db: Data<Arc<Database>>, MultipartForm(form): MultipartForm<UploadImageForm>, server_data: Data<ServerData>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
+	// Permissions
+	if !user.has_scope("images/upload") {
+		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/upload"));
+	}
+
+	let mut files = form.files.into_iter();
+	let file = match files.next() {
+		Some(file) => file,
+		None => return Ok(HttpResponse::BadRequest().body("Expected exactly one file")),
+	};
+
+	if files.next().is_some() {
+		return Ok(HttpResponse::BadRequest().body("Expected exactly one file"));
+	}
+
+	// Check file size
+	if file.size > MAX_FILE_SIZE {
+		return Ok(HttpResponse::PayloadTooLarge().body("File too large"));
+	}
+
+	// Hash the file
+	let async_file = tokio::fs::File::from_std(file.file.reopen().context("Failed to reopen temporary file")?);
+	let file_hash = hash_async_reader(async_file).await.context("Failed to hash file")?;
+
+	// Format the (potential) image paths
+	let hash_str = hex::encode(file_hash.0);
+	let image_path_parent = std::path::absolute(server_data.image_dir.join(&hash_str[0..2]).join(&hash_str[2..4])).context("Failed to get absolute path")?;
+	let image_path = image_path_parent.join(&hash_str);
+	let upload_path_parent = std::path::absolute(server_data.upload_dir.join(&hash_str[0..2]).join(&hash_str[2..4])).context("Failed to get absolute path")?;
+	let upload_path = upload_path_parent.join(&hash_str);
+	let relative_path = pathdiff::diff_paths(&upload_path, &image_path_parent).ok_or_else(|| anyhow::anyhow!("Failed to get relative path between {:?} and {:?}", upload_path, image_path_parent))?;
+
+	// Create the directories if they don't exist
+	tokio::fs::create_dir_all(image_path_parent).await.context("Failed to create directory")?;
+	tokio::fs::create_dir_all(upload_path_parent).await.context("Failed to create directory")?;
+
+	// Persist to the upload path if it doesn't exist
+	// There's a small race condition here, but worst case it just causes an error and the user has to try again
+	if !upload_path.exists() {
+		tokio::fs::set_permissions(file.file.path(), std::fs::Permissions::from_mode(0o644)).await.context("Failed to set file permissions")?;
+		file.file.persist_noclobber(&upload_path).context("Failed to persist temporary file")?;
+	}
+
+	// Symlink the file to the image directory
+	// IIUC this is noclobber, so will fail if the file already exists (which is what we want)
+	match tokio::fs::symlink(relative_path, &image_path).await {
+		Ok(_) => {},
+		Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {},
+		Err(err) => return Err(anyhow::Error::new(err).context("Failed to create symlink").into()),
+	}
+
+	// Double check that everything is correct before adding the image to the database
+	if !tokio::fs::try_exists(&image_path).await.context("Failed to check if image exists")? {
+		return Err(anyhow::anyhow!("Symlink does not exist or points to a non-existent file: {:?}", image_path).into());
+	}
+
+	// Add the image to the database
+	if !db.add_image(file_hash, user.id).await.context("Failed to add image to database")? {
+		return Ok(HttpResponse::Conflict().reason("Database conflict").finish());
+	}
+
+	Ok(HttpResponse::Created().finish())
+}
+
+
+#[actix_web::post("/images/{image}/imgops")]
+async fn imgops_upload(user: AuthenticatedUser, server_data: Data<ServerData>, db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier,)>) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	if !user.has_scope("images/imgops-upload") {
+		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/imgops-upload"));
+	}
+
+	// Get image
+	let (image, ) = path.into_inner();
+	let images_lock = db.images.read().await;
+	let image = match image {
+		ImageIdentifier::Hash(hash) => db.get_image_by_hash(&hash, &images_lock).await,
+		ImageIdentifier::Id(id) => db.get_image_by_id(id, &images_lock).await,
+	};
+	let image = match image {
+		Some(image) => image,
+		None => return Ok(HttpResponse::NotFound().body("Image not found")),
+	};
+
+	// Check if image is active and exists
+	let hash_str = hex::encode(image.hash.0);
+	let image_path = server_data.image_dir.join(&hash_str[0..2]).join(&hash_str[2..4]).join(&hash_str);
+
+	if !image.active || !image_path.exists() {
+		return Ok(HttpResponse::NotFound().body("Image not found"));
+	}
+
+	// Read file
+	let file_bytes = tokio::fs::read(&image_path).await?;
+
+	// Guess the image type
+	let format = image::guess_format(&file_bytes).ok().map(|f| f.to_mime_type());
+	let mime: mime::Mime = format.unwrap_or_else(|| "application/octet-stream").parse().unwrap();
+
+	let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name("file").mime_str(mime.to_string().as_str()).unwrap();
+	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+	let form = reqwest::multipart::Form::new().part("photo", file_part);
+
+	// Upload the image to imgops
+	let response = client.post("https://imgops.com/store").multipart(form).send().await?;
+	let headers = response.headers();
+	let redirect_url = headers.get("Location").ok_or_else(|| anyhow::anyhow!("No Location header in imgops' response"))?.to_str()?;
+
+	Ok(HttpResponse::Ok().body(redirect_url.to_string()))
+}
+
+
 // TODO: create account
-// TODO: imgops_upload
-// TODO: upload
 
 
 enum ImageIdentifier {
@@ -914,4 +1045,22 @@ fn resize_image(path: &Path, max_side: u32) -> Result<Vec<u8>, anyhow::Error> {
 	img.write_with_encoder(encoder).context("Error encoding image")?;
 
 	Ok(buffer)
+}
+
+
+async fn hash_async_reader<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Result<ImageHash, std::io::Error> {
+	let mut hasher = Sha256::new();
+	let mut buffer = vec![0; 64 * 1024];
+
+	loop {
+		match reader.read(&mut buffer).await {
+			Ok(bytes_read) if bytes_read == 0 => break,
+			Ok(bytes_read) => hasher.update(&buffer[0..bytes_read]),
+			Err(err) => return Err(err),
+		};
+	}
+
+	let hash = hasher.finalize();
+
+	Ok(ImageHash(hash.into()))
 }
