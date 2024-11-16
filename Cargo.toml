@@ -38,3 +38,4 @@ async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["rustls-tls", "multipart", "http2", "charset"], default-features = false }
 actix-multipart = "0.6"
 pathdiff = "0.2"
+flatbuffers = "24.3.25"

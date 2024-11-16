@@ -79,7 +79,7 @@ type FromPairResult<'a, T> = Result<T, pest::error::Error<Rule>>;
 
 #[derive(Debug)]
 pub struct TreeQuery<'a> {
-	pub expression: TreeExpression<'a>,
+	pub expression: Option<TreeExpression<'a>>,
 	pub sort: Option<TreeSort>,
 }
 
@@ -87,15 +87,32 @@ impl<'a> TreeFromPair<'a> for TreeQuery<'a> {
 	fn from_pair_inner(pair: pest::iterators::Pair<'a, Rule>, depth: usize) -> FromPairResult<'a, Self> {
 		assert_eq!(pair.as_rule(), Rule::query);
 
-		let mut pairs = pair.into_inner();
-		let expression = TreeExpression::from_pair(pairs.next().unwrap(), depth + 1)?;
-		let pair = pairs.next().unwrap();
-		let sort = match pair.as_rule() {
-			Rule::sort_clause => Some(TreeSort::from_pair(pair, depth + 1)?),
-			_ => None,
-		};
+		let mut expression = Option::None;
+		let mut sort = Option::None;
+		let span = pair.as_span();
+
+		for inner_pair in pair.into_inner() {
+			match inner_pair.as_rule() {
+				Rule::expression if expression.is_none() => expression = Some(TreeExpression::from_pair(inner_pair, depth + 1)?),
+				Rule::sort_clause if sort.is_none() => sort = Some(TreeSort::from_pair(inner_pair, depth + 1)?),
+				Rule::EOI => (),
+				rule => return Err(pest::error::Error::new_from_span(pest::error::ErrorVariant::CustomError { message: format!("Unexpected rule: {:?}", rule) }, span)),
+			}
+		}
 
 		Ok(Self { expression, sort })
+	}
+}
+
+impl<'a> TreeQuery<'a> {
+	pub fn execute(&'a self, db: &'a Database) -> BoxFuture<'a, Result<ExecutionResult, ExecutionError>> {
+		match self.expression {
+			Some(ref expression) => expression.execute(db),
+			// If there's no expression, return all images
+			None => async {
+				Ok(HashSet::from_iter((0..db.images.read().await.len() as u64).map(ImageId)))
+			}.boxed(),
+		}
 	}
 }
 
@@ -834,11 +851,12 @@ mod tests {
 			("NOT tag = \"portrait\"", vec![ImageId(0), ImageId(1)]),
 			("exists(description)", vec![ImageId(1), ImageId(2)]),
 			("field = \"value\"", vec![]),
+			("", vec![ImageId(0), ImageId(1), ImageId(2), ImageId(3)]),
 		];
 
 		for (query_str, expected_ids) in test_cases {
 			let query = parse_search(query_str).unwrap();
-			let result = query.expression.execute(&db).await.unwrap();
+			let result = query.execute(&db).await.unwrap();
 			let mut result_ids: Vec<_> = result.into_iter().collect();
 			result_ids.sort();
 			assert_eq!(result_ids, expected_ids, "Query failed: {}", query_str);

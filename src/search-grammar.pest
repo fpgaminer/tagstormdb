@@ -1,6 +1,6 @@
 WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 
-query = { SOI ~ expression ~ sort_clause? ~ EOI }
+query = { SOI ~ expression? ~ sort_clause? ~ EOI }
 
 identifier = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 

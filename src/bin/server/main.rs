@@ -1,9 +1,12 @@
 mod auth;
 mod server_error;
 mod tags;
+#[allow(dead_code, unused_imports)]
+#[path = "flatbuffers_generated.rs"]
+mod flatbuffers_generated;
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, sync::Arc
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, str::FromStr, sync::Arc
 };
 
 use actix_cors::Cors;
@@ -14,24 +17,26 @@ use actix_web::{
 	dev::{ServiceFactory, ServiceRequest, ServiceResponse},
 	middleware,
 	web::{self, Data},
-	App, HttpRequest, HttpResponse, HttpServer,
+	App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use anyhow::Context;
 use auth::AuthenticatedUser;
 use clap::Parser;
 use env_logger::Env;
+use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use image::{imageops, ImageReader};
 use rand::{rngs::OsRng, Rng};
-use serde::{ser::Serializer, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use server_error::ServerError;
 use sha2::{Digest, Sha256};
 use tags::TagMappings;
 use tagstormdb::{
-	database::StateUpdateResult, errors::DatabaseError, search::TreeSort, AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId,
+	database::{ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock}, errors::DatabaseError, search::TreeSort, AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId,
 	UserId, UserToken,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use flatbuffers_generated::tag_storm_db as flatbuffer_types;
 
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
@@ -366,9 +371,9 @@ async fn get_image_data(
 	let format = image::guess_format(&buffer).ok().map(|f| f.to_mime_type());
 	let mime: mime::Mime = format.unwrap_or("application/octet-stream").parse().unwrap();
 
-	let file = NamedFile::open(image_path)?.set_content_type(mime);
-
-	Ok(file.into_response(&req))
+	// The files don't change, so we can cache them for a long time
+	let file = NamedFile::open(image_path)?.set_content_type(mime).customize().insert_header(("Cache-Control", "max-age=31536000, immutable"));
+	Ok(file.respond_to(&req).map_into_boxed_body())
 }
 
 
@@ -801,9 +806,46 @@ async fn change_user_scopes(
 }
 
 
+fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<SearchSelect>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+	let s: String = String::deserialize(deserializer)?;
+	s.split(',')
+		.map(|item| item.trim().parse::<SearchSelect>())
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(serde::de::Error::custom)
+}
+
+
 #[derive(Deserialize)]
 struct SearchImagesQuery {
 	query: String,
+	#[serde(deserialize_with = "deserialize_comma_separated")]
+	select: Vec<SearchSelect>,
+}
+
+#[derive(Deserialize, Copy, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchSelect {
+	Id,
+	Hash,
+	Tags,
+	Attributes,
+}
+
+impl FromStr for SearchSelect {
+	type Err = &'static str;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s {
+			"id" => Ok(SearchSelect::Id),
+			"hash" => Ok(SearchSelect::Hash),
+			"tags" => Ok(SearchSelect::Tags),
+			"attributes" => Ok(SearchSelect::Attributes),
+			_ => Err("invalid search select"),
+		}
+	}
 }
 
 
@@ -822,37 +864,223 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 		Err(e) => return Ok(HttpResponse::BadRequest().body(format!("Invalid search query: {}", e))),
 	};
 
-	let results = match search.expression.execute(&db).await {
+	let results = match search.execute(&db).await {
 		Ok(results) => results,
 		Err(e) => return Ok(HttpResponse::InternalServerError().body(format!("Error executing search: {}", e.message))),
 	};
 	log::warn!("Query \"\"\"{}\"\"\" took {:?}ms", query.query, start_time.elapsed().as_millis());
 
 	let images_lock = db.images.clone();
-	let result = tokio::task::spawn_blocking(move || {
-		let images_lock = images_lock.blocking_read();
-		let mut output = Vec::new();
-		let mut serializer = serde_json::Serializer::new(&mut output);
 
-		match search.sort {
+	// For now, we return IDs as u32, since it's more efficient and doesn't require bigint on the client side
+	// If we ever have more than 4 billion of something, this will error out to make sure we don't overflow
+	if db.images.read().await.len() > u32::MAX as usize {
+		return Ok(HttpResponse::InternalServerError().body("Image IDs exceed u32"));
+	}
+
+	if db.tags.read().await.len() > u32::MAX as usize {
+		return Ok(HttpResponse::InternalServerError().body("Tag IDs exceed u32"));
+	}
+
+	let select = query.select.clone();
+	let result = tokio::task::spawn_blocking(move || build_search_response(select, search.sort, results, images_lock, db.string_table.clone())).await.unwrap();
+
+	return Ok(HttpResponse::Ok().content_type("application/octet-stream").body(result));
+}
+
+
+enum SortedSearchResults<'a> {
+	Ids(Box<dyn Iterator<Item = ImageId>>),
+	Entries(Box<dyn Iterator<Item = (&'a ImageHash, &'a ImageEntry)> + 'a>),
+}
+
+impl<'a> SortedSearchResults<'a> {
+	fn new(sort: Option<TreeSort>, results: HashSet<ImageId>, images_lock: &'a ImagesReadGuard) -> Self {
+		match sort {
 			Some(TreeSort::Id) => {
 				let results: BTreeSet<ImageId> = results.into_iter().collect();
-				serializer.collect_seq(results.iter()).unwrap();
+				SortedSearchResults::Ids(Box::new(results.into_iter()))
 			},
 			Some(TreeSort::Hash) => {
-				let results: BTreeMap<&ImageHash, ImageId> = results.into_iter().map(|id| (images_lock.get_by_id_full(id).unwrap().0, id)).collect();
-				let sorted_ids = results.values();
-				serializer.collect_seq(sorted_ids).unwrap();
+				let results: BTreeMap<&ImageHash, &ImageEntry> = results.into_iter().filter_map(|id| images_lock.get_by_id_full(id)).collect();
+				SortedSearchResults::Entries(Box::new(results.into_iter()))
 			},
-			None => serializer.collect_seq(results.into_iter()).unwrap(),
-		};
+			None => {
+				SortedSearchResults::Ids(Box::new(results.into_iter()))
+			},
+		}
+	}
 
-		output
-	})
-	.await
-	.unwrap();
+	/// If access to the image entries is needed, this method turns the sorted results into an iterator over the entries.
+	fn with_images(self, images_lock: &'a ImagesReadGuard) -> Box<dyn Iterator<Item = (ImageId, &'a ImageHash, &'a ImageEntry)> + 'a> {
+		match self {
+			SortedSearchResults::Ids(ids) => Box::new(ids.filter_map(move |id| images_lock.get_by_id_full(id)).map(|(hash, entry)| (entry.id, hash, entry))),
+			SortedSearchResults::Entries(entries) => Box::new(entries.map(|(hash, entry)| (entry.id, hash, entry))),
+		}
+	}
 
-	return Ok(HttpResponse::Ok().content_type("application/json").body(result));
+	fn without_images(self) -> Box<dyn Iterator<Item = ImageId> + 'a> {
+		match self {
+			SortedSearchResults::Ids(ids) => ids,
+			SortedSearchResults::Entries(entries) => Box::new(entries.map(|(_, entry)| entry.id)),
+		}
+	}
+}
+
+
+fn build_search_response(
+	select: Vec<SearchSelect>,
+	sort: Option<TreeSort>,
+	results: HashSet<ImageId>,
+	images_lock: Arc<ImagesRwLock>,
+	strings_lock: Arc<StringTableRwLock>,
+) -> Vec<u8> {
+	let images_lock = images_lock.blocking_read();
+	let mut builder = FlatBufferBuilder::new();
+	let n_results = results.len();
+
+	// Sort
+	let sorted = SortedSearchResults::new(sort, results, &images_lock);
+
+	// Serialize
+	match select.as_slice() {
+		// Only IDs
+		[SearchSelect::Id] => {
+			builder.start_vector::<u32>(n_results);
+			sorted.without_images().for_each(|id| {builder.push(id.0 as u32);});
+			let ids_vector = builder.end_vector(n_results);
+			let id_response = flatbuffer_types::IDResponse::create(
+				&mut builder,
+				&flatbuffer_types::IDResponseArgs {
+					ids: Some(ids_vector),
+				},
+			);
+			let search_response = flatbuffer_types::SearchResultResponse::create(
+				&mut builder,
+				&flatbuffer_types::SearchResultResponseArgs {
+					data_type: flatbuffer_types::ResponseType::IDResponse,
+					data: Some(id_response.as_union_value()),
+				},
+			);
+			builder.finish(search_response, None);
+		},
+
+		// Only hashes
+		[SearchSelect::Hash] => {
+			builder.start_vector::<WIPOffset<flatbuffer_types::Hash>>(n_results);
+			sorted.with_images(&images_lock).for_each(|(_, hash, _)| {
+				builder.push(&flatbuffer_types::Hash(hash.0));
+			});
+			let hashes_vector = builder.end_vector(n_results);
+			let hash_response = flatbuffer_types::HashResponse::create(
+				&mut builder,
+				&flatbuffer_types::HashResponseArgs {
+					hashes: Some(hashes_vector),
+				},
+			);
+			let search_response = flatbuffer_types::SearchResultResponse::create(
+				&mut builder,
+				&flatbuffer_types::SearchResultResponseArgs {
+					data_type: flatbuffer_types::ResponseType::HashResponse,
+					data: Some(hash_response.as_union_value()),
+				},
+			);
+			builder.finish(search_response, None);
+		},
+
+		// Full objects in all other cases
+		_ => {
+			builder.start_vector::<WIPOffset<flatbuffer_types::Image>>(n_results);
+			sorted.with_images(&images_lock)
+				.for_each(|(id, hash, image)| {
+					// Image hash
+					let hash = if select.contains(&SearchSelect::Hash) {
+						Some(flatbuffer_types::Hash(hash.0))
+					} else {
+						None
+					};
+
+					// Image tags
+					let tags = if select.contains(&SearchSelect::Tags) {
+						builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
+						image.tags.iter().for_each(|(tag_id, user_id)| {
+							let tag_with_blame = flatbuffer_types::TagWithBlame::create(
+								&mut builder,
+								&flatbuffer_types::TagWithBlameArgs {
+									tag: tag_id.0 as u32,
+									blame: user_id.0 as u32,
+								},
+							);
+
+							builder.push(&tag_with_blame);
+						});
+						Some(builder.end_vector(image.tags.len()))
+					} else {
+						None
+					};
+
+					// Image attributes
+					let attributes = if select.contains(&SearchSelect::Attributes) {
+						let strings_lock = strings_lock.blocking_read();
+
+						builder.start_vector::<WIPOffset<flatbuffer_types::AttributeWithBlame>>(image.attributes.len());
+
+						image.attributes.iter().for_each(|(key_id, values)| {
+							let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
+							let key_offset = builder.create_string(key_str);
+
+							values.iter().for_each(|(value_id, user_id)| {
+								let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
+								let value_offset = builder.create_string(value_str);
+								let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
+									&mut builder,
+									&flatbuffer_types::AttributeWithBlameArgs {
+										key: Some(key_offset),
+										value: Some(value_offset),
+										blame: user_id.0 as u32,
+									},
+								);
+
+								builder.push(&attribute_with_blame);
+							});
+						});
+						Some(builder.end_vector(image.attributes.len()))
+					} else {
+						None
+					};
+
+					let image = flatbuffers_generated::tag_storm_db::Image::create(
+						&mut builder,
+						&flatbuffers_generated::tag_storm_db::ImageArgs {
+							id: image.id.0 as u32,
+							hash: hash.as_ref(),
+							tags: tags,
+							attributes: attributes,
+						},
+					);
+
+					builder.push(&image);
+				});
+			
+			let images_vector = builder.end_vector(n_results);
+			let image_response = flatbuffer_types::ImageResponse::create(
+				&mut builder,
+				&flatbuffer_types::ImageResponseArgs {
+					images: Some(images_vector),
+				},
+			);
+			let search_response = flatbuffer_types::SearchResultResponse::create(
+				&mut builder,
+				&flatbuffer_types::SearchResultResponseArgs {
+					data_type: flatbuffer_types::ResponseType::ImageResponse,
+					data: Some(image_response.as_union_value()),
+				},
+			);
+			builder.finish(search_response, None);
+		},
+	}
+
+	builder.finished_data().to_vec()
 }
 
 
@@ -863,7 +1091,12 @@ struct UploadImageForm {
 }
 
 #[actix_web::post("/upload_image")]
-async fn upload_image(db: Data<Arc<Database>>, MultipartForm(form): MultipartForm<UploadImageForm>, server_data: Data<ServerData>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
+async fn upload_image(
+	db: Data<Arc<Database>>,
+	MultipartForm(form): MultipartForm<UploadImageForm>,
+	server_data: Data<ServerData>,
+	user: AuthenticatedUser,
+) -> Result<HttpResponse, ServerError> {
 	// Permissions
 	if !user.has_scope("images/upload") {
 		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/upload"));
@@ -894,7 +1127,8 @@ async fn upload_image(db: Data<Arc<Database>>, MultipartForm(form): MultipartFor
 	let image_path = image_path_parent.join(&hash_str);
 	let upload_path_parent = std::path::absolute(server_data.upload_dir.join(&hash_str[0..2]).join(&hash_str[2..4])).context("Failed to get absolute path")?;
 	let upload_path = upload_path_parent.join(&hash_str);
-	let relative_path = pathdiff::diff_paths(&upload_path, &image_path_parent).ok_or_else(|| anyhow::anyhow!("Failed to get relative path between {:?} and {:?}", upload_path, image_path_parent))?;
+	let relative_path = pathdiff::diff_paths(&upload_path, &image_path_parent)
+		.ok_or_else(|| anyhow::anyhow!("Failed to get relative path between {:?} and {:?}", upload_path, image_path_parent))?;
 
 	// Create the directories if they don't exist
 	tokio::fs::create_dir_all(image_path_parent).await.context("Failed to create directory")?;
@@ -903,7 +1137,9 @@ async fn upload_image(db: Data<Arc<Database>>, MultipartForm(form): MultipartFor
 	// Persist to the upload path if it doesn't exist
 	// There's a small race condition here, but worst case it just causes an error and the user has to try again
 	if !upload_path.exists() {
-		tokio::fs::set_permissions(file.file.path(), std::fs::Permissions::from_mode(0o644)).await.context("Failed to set file permissions")?;
+		tokio::fs::set_permissions(file.file.path(), std::fs::Permissions::from_mode(0o644))
+			.await
+			.context("Failed to set file permissions")?;
 		file.file.persist_noclobber(&upload_path).context("Failed to persist temporary file")?;
 	}
 
@@ -930,14 +1166,19 @@ async fn upload_image(db: Data<Arc<Database>>, MultipartForm(form): MultipartFor
 
 
 #[actix_web::post("/images/{image}/imgops")]
-async fn imgops_upload(user: AuthenticatedUser, server_data: Data<ServerData>, db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier,)>) -> Result<HttpResponse, ServerError> {
+async fn imgops_upload(
+	user: AuthenticatedUser,
+	server_data: Data<ServerData>,
+	db: Data<Arc<Database>>,
+	path: web::Path<(ImageIdentifier,)>,
+) -> Result<HttpResponse, ServerError> {
 	// Check permissions
 	if !user.has_scope("images/imgops-upload") {
 		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/imgops-upload"));
 	}
 
 	// Get image
-	let (image, ) = path.into_inner();
+	let (image,) = path.into_inner();
 	let images_lock = db.images.read().await;
 	let image = match image {
 		ImageIdentifier::Hash(hash) => db.get_image_by_hash(&hash, &images_lock).await,
@@ -963,14 +1204,20 @@ async fn imgops_upload(user: AuthenticatedUser, server_data: Data<ServerData>, d
 	let format = image::guess_format(&file_bytes).ok().map(|f| f.to_mime_type());
 	let mime: mime::Mime = format.unwrap_or_else(|| "application/octet-stream").parse().unwrap();
 
-	let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name("file").mime_str(mime.to_string().as_str()).unwrap();
+	let file_part = reqwest::multipart::Part::bytes(file_bytes)
+		.file_name("file")
+		.mime_str(mime.to_string().as_str())
+		.unwrap();
 	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
 	let form = reqwest::multipart::Form::new().part("photo", file_part);
 
 	// Upload the image to imgops
 	let response = client.post("https://imgops.com/store").multipart(form).send().await?;
 	let headers = response.headers();
-	let redirect_url = headers.get("Location").ok_or_else(|| anyhow::anyhow!("No Location header in imgops' response"))?.to_str()?;
+	let redirect_url = headers
+		.get("Location")
+		.ok_or_else(|| anyhow::anyhow!("No Location header in imgops' response"))?
+		.to_str()?;
 
 	Ok(HttpResponse::Ok().body(redirect_url.to_string()))
 }

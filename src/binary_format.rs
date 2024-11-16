@@ -338,6 +338,7 @@ pub fn read_string_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> 
 		.with_prefix("Reading string table");
 	let mut table = IndexMapTyped::with_capacity(num_strings);
 	let mut reader = HasherReader::new(reader, Xxh3::new());
+	pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
 	loop {
 		reader.reset();
@@ -448,6 +449,7 @@ pub fn read_hash_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> Re
 	let pb = ProgressBar::with_draw_target(Some(num_hashes as u64), pb_target)
 		.with_prefix("Reading image hashes")
 		.with_style(default_progress_style());
+	pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
 	for _ in 0..num_hashes {
 		let mut image_hash = ImageHash([0u8; 32]);
@@ -653,6 +655,7 @@ pub(crate) fn read_user_tokens_table<R: Read + Seek>(mut reader: R, with_progres
 	let pb = ProgressBar::with_draw_target(Some(num_tokens as u64), pb_target)
 		.with_prefix("Reading user tokens")
 		.with_style(default_progress_style());
+	pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
 	for _ in 0..num_tokens {
 		// Read user token and user_id

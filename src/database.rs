@@ -79,8 +79,10 @@ impl UserEntry {
 }
 
 
+pub type ImagesRwLock = RwLock<IndexMapTyped<ImageHash, ImageEntry, ImageId>>;
 type ImagesRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<ImageHash, ImageEntry, ImageId>>;
-type ImagesReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<ImageHash, ImageEntry, ImageId>>;
+pub type ImagesReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<ImageHash, ImageEntry, ImageId>>;
+pub type StringTableRwLock = RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type StringTableRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type StringTableReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type IndexByAttributeNumericRwGuard<'a> = RwLockWriteGuard<'a, NumericAttributeIndex>;
@@ -90,7 +92,7 @@ type UsersReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, UserEntry, U
 pub struct Database {
 	pub images: Arc<RwLock<IndexMapTyped<ImageHash, ImageEntry, ImageId>>>,
 	pub tags: RwLock<IndexMapTyped<String, TagEntry, TagId>>,
-	pub string_table: RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>,
+	pub string_table: Arc<RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>>,
 	pub users: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
 	pub user_tokens: RwLock<HashMap<UserToken, UserId>>,
 
@@ -174,7 +176,7 @@ impl Database {
 			// Create the database object
 			let database = Self {
 				images: Arc::new(RwLock::new(images)),
-				string_table: RwLock::new(string_table),
+				string_table: Arc::new(RwLock::new(string_table)),
 				tags: RwLock::new(IndexMapTyped::new()),
 				users: Arc::new(RwLock::new(users)),
 				user_tokens: RwLock::new(user_tokens),
@@ -197,11 +199,7 @@ impl Database {
 		// Load the database
 		let start_time = std::time::Instant::now();
 		database.load(with_progress).await?;
-		log::info!(
-			"Loaded {} images into database in {:?}",
-			database.images.read().await.len(),
-			start_time.elapsed()
-		);
+		log::info!("Loaded logs into database in {:?}", start_time.elapsed());
 
 		Ok(database)
 	}

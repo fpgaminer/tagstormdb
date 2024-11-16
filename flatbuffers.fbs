@@ -1,0 +1,47 @@
+namespace TagStormDb;
+
+struct Hash {
+	hash: [ubyte:32];
+}
+
+table TagWithBlame {
+	tag: uint32;
+	blame: uint32;
+}
+
+table AttributeWithBlame {
+	key: string;
+	value: string;
+	blame: uint32;
+}
+
+table Image {
+	id: uint32;
+	hash: Hash;
+	tags: [TagWithBlame];
+	attributes: [AttributeWithBlame];
+}
+
+table ImageResponse {
+	images: [Image];
+}
+
+table IDResponse {
+	ids: [uint32];
+}
+
+table HashResponse {
+	hashes: [Hash];
+}
+
+union ResponseType {
+	IDResponse,
+	HashResponse,
+	ImageResponse,
+}
+
+table SearchResultResponse {
+	data: ResponseType;
+}
+
+root_type SearchResultResponse;
