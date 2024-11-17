@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import os
 import struct
 import xxhash
 import argparse
-from hashlib import sha256
+from hashlib import sha256, scrypt
+import string
+import secrets
 
 
 parser = argparse.ArgumentParser(description='Create a user table file')
@@ -16,8 +17,10 @@ args = parser.parse_args()
 def main():
 	args = parser.parse_args()
 
-	# Generate a secure random login key
-	login_key = os.urandom(32)
+	# Generate a secure random password
+	alphabet = string.ascii_letters + string.digits
+	password = ''.join(secrets.choice(alphabet) for i in range(20))
+	login_key = login_key_from_password(args.username, password)
 	hashed_login_key = sha256(login_key).digest()
 
 	with open(args.filename, 'wb') as f:
@@ -43,7 +46,14 @@ def main():
 		# Write the buffer to the file
 		f.write(buffer)
 
-	print("Login key (hex):", login_key.hex())
+	print("Password:", password)
+
+
+def login_key_from_password(username: str, password: str) -> bytes:
+	# Scrypt the password
+	login_key = scrypt(password.encode('utf-8'), salt=username.encode('utf-8'), n=2**16, r=8, p=1, maxmem=128*1024*1024, dklen=32)
+
+	return login_key
 
 
 def write_vli(buffer, n):

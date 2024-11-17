@@ -96,7 +96,14 @@ impl<'a> TreeFromPair<'a> for TreeQuery<'a> {
 				Rule::expression if expression.is_none() => expression = Some(TreeExpression::from_pair(inner_pair, depth + 1)?),
 				Rule::sort_clause if sort.is_none() => sort = Some(TreeSort::from_pair(inner_pair, depth + 1)?),
 				Rule::EOI => (),
-				rule => return Err(pest::error::Error::new_from_span(pest::error::ErrorVariant::CustomError { message: format!("Unexpected rule: {:?}", rule) }, span)),
+				rule => {
+					return Err(pest::error::Error::new_from_span(
+						pest::error::ErrorVariant::CustomError {
+							message: format!("Unexpected rule: {:?}", rule),
+						},
+						span,
+					))
+				},
 			}
 		}
 
@@ -109,9 +116,7 @@ impl<'a> TreeQuery<'a> {
 		match self.expression {
 			Some(ref expression) => expression.execute(db),
 			// If there's no expression, return all images
-			None => async {
-				Ok(HashSet::from_iter((0..db.images.read().await.len() as u64).map(ImageId)))
-			}.boxed(),
+			None => async { Ok(HashSet::from_iter((0..db.images.read().await.len() as u64).map(ImageId))) }.boxed(),
 		}
 	}
 }

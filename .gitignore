@@ -2,3 +2,7 @@
 *.bin
 /tag_*.json
 /tag_*.txt
+images/
+upload/
+perf.data*
+db/

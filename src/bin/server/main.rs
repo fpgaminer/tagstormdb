@@ -1,12 +1,16 @@
 mod auth;
-mod server_error;
-mod tags;
 #[allow(dead_code, unused_imports)]
 #[path = "flatbuffers_generated.rs"]
 mod flatbuffers_generated;
+mod server_error;
+mod tags;
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, str::FromStr, sync::Arc
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	os::unix::fs::PermissionsExt,
+	path::{Path, PathBuf},
+	str::FromStr,
+	sync::Arc,
 };
 
 use actix_cors::Cors;
@@ -22,24 +26,31 @@ use actix_web::{
 use anyhow::Context;
 use auth::AuthenticatedUser;
 use clap::Parser;
+use data_encoding::BASE32;
 use env_logger::Env;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
+use flatbuffers_generated::tag_storm_db as flatbuffer_types;
+use hmac::{Hmac, Mac};
 use image::{imageops, ImageReader};
-use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use server_error::ServerError;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tags::TagMappings;
 use tagstormdb::{
-	database::{ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock}, errors::DatabaseError, search::TreeSort, AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId,
-	UserId, UserToken,
+	database::{ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock},
+	errors::DatabaseError,
+	search::TreeSort,
+	AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId, UserId, UserToken,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use flatbuffers_generated::tag_storm_db as flatbuffer_types;
+use tokio::io::AsyncReadExt;
 
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+
+// Can see their own user info, can change their own login key, can use imgops
+// Notably missing: can't create a user token for themselves, i.e. can't log in
+const DEFAULT_USER_SCOPES: &str = "users/{id}/info, users/{id}/login_key/change, images/imgops-upload";
 
 
 #[derive(Parser, Debug)]
@@ -64,6 +75,10 @@ struct Args {
 	/// Path to the database directory.
 	#[arg(long, default_value = "db")]
 	db_dir: PathBuf,
+
+	/// Path to the server secrets file.
+	#[arg(long, default_value = "db/secrets.json")]
+	secrets_path: PathBuf,
 }
 
 
@@ -71,7 +86,15 @@ struct Args {
 struct ServerData {
 	image_dir: PathBuf,
 	upload_dir: PathBuf,
-	server_secret: [u8; 32],
+	server_secrets: ServerSecrets,
+}
+
+#[derive(Deserialize, Clone)]
+struct ServerSecrets {
+	#[serde(deserialize_with = "deserialize_hex")]
+	server_secret: Vec<u8>,
+	cf_turnstile_public: Option<String>,
+	cf_turnstile_private: Option<String>,
 }
 
 
@@ -89,14 +112,14 @@ async fn main() -> Result<(), anyhow::Error> {
 	// Load database
 	let database = Arc::new(Database::open(&args.db_dir, true).await?);
 
-	// Load server secret
-	let server_secret = load_server_secret(&args.db_dir).await?;
+	// Load server secrets
+	let server_secrets = load_server_secrets(&args.secrets_path).await?;
 
 	// Setup HTTP server
 	let server_data = ServerData {
 		image_dir: args.image_dir,
 		upload_dir: args.upload_dir,
-		server_secret,
+		server_secrets,
 	};
 
 	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone()))
@@ -111,27 +134,13 @@ async fn main() -> Result<(), anyhow::Error> {
 }
 
 
-async fn load_server_secret<P: AsRef<Path>>(path: P) -> Result<[u8; 32], anyhow::Error> {
-	let secret_path = path.as_ref().join("server_secret.bin");
+async fn load_server_secrets<P: AsRef<Path>>(path: P) -> Result<ServerSecrets, anyhow::Error> {
+	let mut secret_file = tokio::fs::OpenOptions::new().read(true).open(path).await?;
+	let mut data = String::new();
+	secret_file.read_to_string(&mut data).await?;
+	let secrets: ServerSecrets = serde_json::from_str(&data)?;
 
-	let mut secret_file = match tokio::fs::OpenOptions::new().read(true).open(&secret_path).await {
-		Ok(file) => file,
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-			// Generate a new secret
-			let secret: [u8; 32] = OsRng.gen();
-			let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&secret_path).await?;
-			file.write_all(&secret).await?;
-			file.sync_all().await?;
-			file.seek(std::io::SeekFrom::Start(0)).await?;
-			file
-		},
-		Err(err) => return Err(err.into()),
-	};
-
-	let mut secret = [0; 32];
-	secret_file.read_exact(&mut secret).await?;
-
-	Ok(secret)
+	Ok(secrets)
 }
 
 
@@ -175,13 +184,14 @@ fn build_app(
 		.service(login)
 		.service(change_login_key)
 		.service(user_info)
-		.service(create_new_user_token)
 		.service(invalidate_user_token)
 		.service(list_user_tokens)
 		.service(change_user_scopes)
 		.service(search_images)
 		.service(upload_image)
 		.service(imgops_upload)
+		.service(create_user)
+		.service(get_cf_turnstile_key)
 }
 
 
@@ -372,7 +382,10 @@ async fn get_image_data(
 	let mime: mime::Mime = format.unwrap_or("application/octet-stream").parse().unwrap();
 
 	// The files don't change, so we can cache them for a long time
-	let file = NamedFile::open(image_path)?.set_content_type(mime).customize().insert_header(("Cache-Control", "max-age=31536000, immutable"));
+	let file = NamedFile::open(image_path)?
+		.set_content_type(mime)
+		.customize()
+		.insert_header(("Cache-Control", "max-age=31536000, immutable"));
 	Ok(file.respond_to(&req).map_into_boxed_body())
 }
 
@@ -654,21 +667,21 @@ async fn login(db: Data<Arc<Database>>, query: web::Json<LoginQuery>) -> Result<
 		None => return Ok(HttpResponse::Unauthorized().body("Invalid login")),
 	};
 
+	// Check if this user has permissions to create a user token for themselves
+	let users = db.users.read().await;
+	let (_, user) = db
+		.get_user_by_id(user_id, &users)
+		.ok_or_else(|| anyhow::anyhow!("User not found after authentication"))?;
+	let scope = format!("users/{}/tokens/create", user_id);
+	if !user.scopes_matcher.is_match(&scope) {
+		return Ok(HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)));
+	}
+
 	// Create a new user token
 	let user_token = db.create_user_token(user_id).await?;
 
 	// Return the token
 	Ok(HttpResponse::Ok().json(json!({
-		"token": hex::encode(user_token.0),
-	})))
-}
-
-
-/// Create a new user token
-#[actix_web::post("/users/me/tokens")]
-async fn create_new_user_token(db: Data<Arc<Database>>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
-	let user_token = db.create_user_token(user.id).await?;
-	Ok(HttpResponse::Created().json(json!({
 		"token": hex::encode(user_token.0),
 	})))
 }
@@ -808,7 +821,7 @@ async fn change_user_scopes(
 
 fn deserialize_comma_separated<'de, D>(deserializer: D) -> Result<Vec<SearchSelect>, D::Error>
 where
-    D: Deserializer<'de>,
+	D: Deserializer<'de>,
 {
 	let s: String = String::deserialize(deserializer)?;
 	s.split(',')
@@ -883,7 +896,9 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 	}
 
 	let select = query.select.clone();
-	let result = tokio::task::spawn_blocking(move || build_search_response(select, search.sort, results, images_lock, db.string_table.clone())).await.unwrap();
+	let result = tokio::task::spawn_blocking(move || build_search_response(select, search.sort, results, images_lock, db.string_table.clone()))
+		.await
+		.unwrap();
 
 	return Ok(HttpResponse::Ok().content_type("application/octet-stream").body(result));
 }
@@ -905,16 +920,17 @@ impl<'a> SortedSearchResults<'a> {
 				let results: BTreeMap<&ImageHash, &ImageEntry> = results.into_iter().filter_map(|id| images_lock.get_by_id_full(id)).collect();
 				SortedSearchResults::Entries(Box::new(results.into_iter()))
 			},
-			None => {
-				SortedSearchResults::Ids(Box::new(results.into_iter()))
-			},
+			None => SortedSearchResults::Ids(Box::new(results.into_iter())),
 		}
 	}
 
 	/// If access to the image entries is needed, this method turns the sorted results into an iterator over the entries.
 	fn with_images(self, images_lock: &'a ImagesReadGuard) -> Box<dyn Iterator<Item = (ImageId, &'a ImageHash, &'a ImageEntry)> + 'a> {
 		match self {
-			SortedSearchResults::Ids(ids) => Box::new(ids.filter_map(move |id| images_lock.get_by_id_full(id)).map(|(hash, entry)| (entry.id, hash, entry))),
+			SortedSearchResults::Ids(ids) => Box::new(
+				ids.filter_map(move |id| images_lock.get_by_id_full(id))
+					.map(|(hash, entry)| (entry.id, hash, entry)),
+			),
 			SortedSearchResults::Entries(entries) => Box::new(entries.map(|(hash, entry)| (entry.id, hash, entry))),
 		}
 	}
@@ -947,14 +963,11 @@ fn build_search_response(
 		// Only IDs
 		[SearchSelect::Id] => {
 			builder.start_vector::<u32>(n_results);
-			sorted.without_images().for_each(|id| {builder.push(id.0 as u32);});
+			sorted.without_images().for_each(|id| {
+				builder.push(id.0 as u32);
+			});
 			let ids_vector = builder.end_vector(n_results);
-			let id_response = flatbuffer_types::IDResponse::create(
-				&mut builder,
-				&flatbuffer_types::IDResponseArgs {
-					ids: Some(ids_vector),
-				},
-			);
+			let id_response = flatbuffer_types::IDResponse::create(&mut builder, &flatbuffer_types::IDResponseArgs { ids: Some(ids_vector) });
 			let search_response = flatbuffer_types::SearchResultResponse::create(
 				&mut builder,
 				&flatbuffer_types::SearchResultResponseArgs {
@@ -972,12 +985,7 @@ fn build_search_response(
 				builder.push(&flatbuffer_types::Hash(hash.0));
 			});
 			let hashes_vector = builder.end_vector(n_results);
-			let hash_response = flatbuffer_types::HashResponse::create(
-				&mut builder,
-				&flatbuffer_types::HashResponseArgs {
-					hashes: Some(hashes_vector),
-				},
-			);
+			let hash_response = flatbuffer_types::HashResponse::create(&mut builder, &flatbuffer_types::HashResponseArgs { hashes: Some(hashes_vector) });
 			let search_response = flatbuffer_types::SearchResultResponse::create(
 				&mut builder,
 				&flatbuffer_types::SearchResultResponseArgs {
@@ -991,84 +999,78 @@ fn build_search_response(
 		// Full objects in all other cases
 		_ => {
 			builder.start_vector::<WIPOffset<flatbuffer_types::Image>>(n_results);
-			sorted.with_images(&images_lock)
-				.for_each(|(id, hash, image)| {
-					// Image hash
-					let hash = if select.contains(&SearchSelect::Hash) {
-						Some(flatbuffer_types::Hash(hash.0))
-					} else {
-						None
-					};
+			sorted.with_images(&images_lock).for_each(|(_id, hash, image)| {
+				// Image hash
+				let hash = if select.contains(&SearchSelect::Hash) {
+					Some(flatbuffer_types::Hash(hash.0))
+				} else {
+					None
+				};
 
-					// Image tags
-					let tags = if select.contains(&SearchSelect::Tags) {
-						builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
-						image.tags.iter().for_each(|(tag_id, user_id)| {
-							let tag_with_blame = flatbuffer_types::TagWithBlame::create(
+				// Image tags
+				let tags = if select.contains(&SearchSelect::Tags) {
+					builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
+					image.tags.iter().for_each(|(tag_id, user_id)| {
+						let tag_with_blame = flatbuffer_types::TagWithBlame::create(
+							&mut builder,
+							&flatbuffer_types::TagWithBlameArgs {
+								tag: tag_id.0 as u32,
+								blame: user_id.0 as u32,
+							},
+						);
+
+						builder.push(&tag_with_blame);
+					});
+					Some(builder.end_vector(image.tags.len()))
+				} else {
+					None
+				};
+
+				// Image attributes
+				let attributes = if select.contains(&SearchSelect::Attributes) {
+					let strings_lock = strings_lock.blocking_read();
+
+					builder.start_vector::<WIPOffset<flatbuffer_types::AttributeWithBlame>>(image.attributes.len());
+
+					image.attributes.iter().for_each(|(key_id, values)| {
+						let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
+						let key_offset = builder.create_string(key_str);
+
+						values.iter().for_each(|(value_id, user_id)| {
+							let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
+							let value_offset = builder.create_string(value_str);
+							let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
 								&mut builder,
-								&flatbuffer_types::TagWithBlameArgs {
-									tag: tag_id.0 as u32,
+								&flatbuffer_types::AttributeWithBlameArgs {
+									key: Some(key_offset),
+									value: Some(value_offset),
 									blame: user_id.0 as u32,
 								},
 							);
 
-							builder.push(&tag_with_blame);
+							builder.push(&attribute_with_blame);
 						});
-						Some(builder.end_vector(image.tags.len()))
-					} else {
-						None
-					};
+					});
+					Some(builder.end_vector(image.attributes.len()))
+				} else {
+					None
+				};
 
-					// Image attributes
-					let attributes = if select.contains(&SearchSelect::Attributes) {
-						let strings_lock = strings_lock.blocking_read();
+				let image = flatbuffers_generated::tag_storm_db::Image::create(
+					&mut builder,
+					&flatbuffers_generated::tag_storm_db::ImageArgs {
+						id: image.id.0 as u32,
+						hash: hash.as_ref(),
+						tags: tags,
+						attributes,
+					},
+				);
 
-						builder.start_vector::<WIPOffset<flatbuffer_types::AttributeWithBlame>>(image.attributes.len());
+				builder.push(&image);
+			});
 
-						image.attributes.iter().for_each(|(key_id, values)| {
-							let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
-							let key_offset = builder.create_string(key_str);
-
-							values.iter().for_each(|(value_id, user_id)| {
-								let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
-								let value_offset = builder.create_string(value_str);
-								let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
-									&mut builder,
-									&flatbuffer_types::AttributeWithBlameArgs {
-										key: Some(key_offset),
-										value: Some(value_offset),
-										blame: user_id.0 as u32,
-									},
-								);
-
-								builder.push(&attribute_with_blame);
-							});
-						});
-						Some(builder.end_vector(image.attributes.len()))
-					} else {
-						None
-					};
-
-					let image = flatbuffers_generated::tag_storm_db::Image::create(
-						&mut builder,
-						&flatbuffers_generated::tag_storm_db::ImageArgs {
-							id: image.id.0 as u32,
-							hash: hash.as_ref(),
-							tags: tags,
-							attributes: attributes,
-						},
-					);
-
-					builder.push(&image);
-				});
-			
 			let images_vector = builder.end_vector(n_results);
-			let image_response = flatbuffer_types::ImageResponse::create(
-				&mut builder,
-				&flatbuffer_types::ImageResponseArgs {
-					images: Some(images_vector),
-				},
-			);
+			let image_response = flatbuffer_types::ImageResponse::create(&mut builder, &flatbuffer_types::ImageResponseArgs { images: Some(images_vector) });
 			let search_response = flatbuffer_types::SearchResultResponse::create(
 				&mut builder,
 				&flatbuffer_types::SearchResultResponseArgs {
@@ -1202,7 +1204,7 @@ async fn imgops_upload(
 
 	// Guess the image type
 	let format = image::guess_format(&file_bytes).ok().map(|f| f.to_mime_type());
-	let mime: mime::Mime = format.unwrap_or_else(|| "application/octet-stream").parse().unwrap();
+	let mime: mime::Mime = format.unwrap_or("application/octet-stream").parse().unwrap();
 
 	let file_part = reqwest::multipart::Part::bytes(file_bytes)
 		.file_name("file")
@@ -1223,7 +1225,145 @@ async fn imgops_upload(
 }
 
 
-// TODO: create account
+#[derive(Deserialize)]
+struct CreateUserQuery {
+	username: String,
+	login_key: LoginKey,
+	birthdate: i64,
+	cf_turnstile_token: String,
+	invite_code: String,
+}
+
+#[actix_web::post("/users")]
+async fn create_user(
+	db: Data<Arc<Database>>,
+	query: web::Json<CreateUserQuery>,
+	server_data: Data<ServerData>,
+	req: HttpRequest,
+) -> Result<HttpResponse, ServerError> {
+	// TODO: Do optional user authentication so that users with the "users/create" scope can create users
+	// with arbitrary scopes and such.
+
+	// Get ip
+	let ip = req
+		.headers()
+		.get("x-real-ip")
+		.and_then(|v| v.to_str().ok())
+		.ok_or_else(|| anyhow::anyhow!("Failed to get IP of client using the x-real-ip header"))?;
+
+	// Verify Cloudflare Turnstile
+	if !verify_cf_turnstile(&server_data, &query.cf_turnstile_token, ip).await? {
+		return Ok(HttpResponse::Forbidden().body("Cloudflare Turnstile failed"));
+	}
+
+	// Verify invitation code
+	if let Err(err) = verify_invitation_code(&server_data, &query.invite_code) {
+		return Ok(HttpResponse::Forbidden().body(err));
+	}
+
+	// Verify that user is 18+
+	let now = chrono::Utc::now().timestamp();
+	if now - query.birthdate < 18 * 365 * 24 * 60 * 60 {
+		return Ok(HttpResponse::Forbidden().body("User is not 18+"));
+	}
+
+	// Hash the login key
+	let hashed_login_key = query.login_key.hash();
+
+	// TODO: Encrypt login key
+
+	// Create the user
+	let user_id = match db.add_user(query.username.clone(), hashed_login_key, "".to_string()).await {
+		Ok(user_id) => user_id,
+		Err(DatabaseError::UserAlreadyExists) => return Ok(HttpResponse::Conflict().body("User already exists")),
+		Err(e) => return Err(anyhow::Error::new(e).context("Failed to create user").into()),
+	};
+
+	// Set scopes
+	let scopes = DEFAULT_USER_SCOPES.replace("{id}", &user_id.0.to_string());
+	db.change_user_scopes(user_id, scopes).await.context("Failed to set user scopes")?;
+
+	Ok(HttpResponse::Created().finish())
+}
+
+
+fn verify_invitation_code(server_data: &ServerData, code: &str) -> Result<(), &'static str> {
+	// Try to decode from base32
+	let code = BASE32
+		.decode(code.to_uppercase().as_bytes())
+		.map_err(|_| "Invitation code is not valid base32")?;
+
+	// An invitation code should be 8 bytes for the expiration timestamp and 32 bytes for the authentication code
+	if code.len() != 8 + 32 {
+		return Err("Invalid invitation code format");
+	}
+
+	// Derive our key from the server's key
+	let key = derive_key(&server_data.server_secrets.server_secret, b"user-invitation-auth");
+
+	// Authenticate
+	let timestamp_bytes = match authenticate_data(b"user-invitation-code", &code, &key) {
+		Some(timestamp_bytes) => timestamp_bytes,
+		None => return Err("Invalid invitation code"),
+	};
+
+	// Check expiration
+	let expiration = i64::from_le_bytes(timestamp_bytes.try_into().expect("unexpected"));
+
+	if expiration < chrono::Utc::now().timestamp() {
+		return Err("Invitation code expired");
+	}
+
+	Ok(())
+}
+
+
+async fn verify_cf_turnstile(server_data: &ServerData, token: &str, ip: &str) -> Result<bool, ServerError> {
+	#[derive(Deserialize)]
+	struct TurnstileResponse {
+		success: bool,
+		#[serde(rename = "error-codes")]
+		error_codes: Vec<String>,
+	}
+
+	let cf_turnstile_key = server_data
+		.server_secrets
+		.cf_turnstile_private
+		.as_ref()
+		.ok_or_else(|| anyhow::anyhow!("Cloudflare Turnstile secret not set"))?;
+
+	let url = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+	let client = reqwest::Client::new();
+	let response = client
+		.post(url)
+		.header("Content-Type", "application/json")
+		.json(&json!({
+			"secret": cf_turnstile_key,
+			"response": token,
+			"remoteip": ip,
+		}))
+		.send()
+		.await
+		.context("Failed to send request to Cloudflare Turnstile")?;
+
+	let response: TurnstileResponse = response.json().await.context("Failed to parse Cloudflare Turnstile response")?;
+
+	if !response.success {
+		log::info!("Cloudflare Turnstile failed: {:?}", response.error_codes);
+	}
+
+	Ok(response.success)
+}
+
+
+/// Get the Cloudflare Turnstile public site key
+#[actix_web::get("/cf_turnstile_key")]
+async fn get_cf_turnstile_key(server_data: Data<ServerData>) -> HttpResponse {
+	match &server_data.server_secrets.cf_turnstile_public {
+		Some(key) => HttpResponse::Ok().body(key.clone()),
+		None => HttpResponse::NotFound().finish(),
+	}
+}
 
 
 enum ImageIdentifier {
@@ -1301,7 +1441,7 @@ async fn hash_async_reader<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Re
 
 	loop {
 		match reader.read(&mut buffer).await {
-			Ok(bytes_read) if bytes_read == 0 => break,
+			Ok(0) => break,
 			Ok(bytes_read) => hasher.update(&buffer[0..bytes_read]),
 			Err(err) => return Err(err),
 		};
@@ -1310,4 +1450,66 @@ async fn hash_async_reader<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Re
 	let hash = hasher.finalize();
 
 	Ok(ImageHash(hash.into()))
+}
+
+
+/// Authenticate data using an HMAC-SHA512 construct
+/// The data is expected to be a byte array with a 32-byte hmac at the end
+/// AAD is additional authenticated data, which can be used to make the authentication context more specific
+///
+/// Returns the authenticated data if the authentication was successful
+/// Otherwise returns None
+fn authenticate_data<'a>(aad: &[u8], data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+	assert!(key.len() >= 32);
+
+	// We expect data to be arbitrary data with a 32-byte hmac at the end
+	if data.len() < 32 {
+		return None;
+	}
+
+	let (data, stored_hmac) = data.split_at(data.len() - 32);
+	assert_eq!(stored_hmac.len(), 32);
+
+	// Compute the hmac
+	let mut hmac = Hmac::<Sha512>::new_from_slice(key).expect("unexpected");
+	hmac.update(aad);
+	hmac.update(data);
+	hmac.update(&u64::try_from(aad.len()).expect("length did not fit into u64").to_le_bytes());
+	hmac.update(&u64::try_from(data.len()).expect("length did not fit into u64").to_le_bytes());
+
+	// Truncate to 256 bits
+	let computed_hmac = hmac.finalize().into_bytes();
+	assert_eq!(computed_hmac.len(), 64);
+	let computed_hmac = &computed_hmac[0..32];
+
+	// Constant time compare
+	use ::subtle::ConstantTimeEq;
+
+	if computed_hmac.ct_eq(stored_hmac).into() {
+		Some(data)
+	} else {
+		None
+	}
+}
+
+
+/// Derive a key from a master key
+fn derive_key(master_key: &[u8], purpose: &[u8]) -> [u8; 64] {
+	assert!(master_key.len() >= 32);
+	assert!(!purpose.is_empty());
+
+	let mut hmac = Hmac::<Sha512>::new_from_slice(master_key).expect("unexpected");
+	hmac.update(purpose);
+	let key = hmac.finalize().into_bytes();
+
+	key.into()
+}
+
+
+fn deserialize_hex<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let s: String = String::deserialize(deserializer)?;
+	hex::decode(&s).map_err(serde::de::Error::custom)
 }
