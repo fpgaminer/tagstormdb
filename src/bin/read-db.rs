@@ -18,6 +18,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Debug, FromRow)]
 struct LogEntry {
+	#[allow(dead_code)]
 	id: i64,
 	timestamp: chrono::NaiveDateTime,
 	user_id: i64,

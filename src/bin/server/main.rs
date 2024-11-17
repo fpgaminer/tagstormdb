@@ -101,7 +101,7 @@ struct ServerSecrets {
 #[actix_web::main]
 async fn main() -> Result<(), anyhow::Error> {
 	// Env logger
-	env_logger::Builder::from_env(Env::default().default_filter_or("warn,actix_web=debug,tag_rust_db=debug,actix_server=info,server=info")).init();
+	env_logger::Builder::from_env(Env::default().default_filter_or("warn,actix_web=debug,tagstormdb=debug,actix_server=info,server=info")).init();
 
 	// Parse command line arguments
 	let args = Args::parse();
@@ -1061,7 +1061,7 @@ fn build_search_response(
 					&flatbuffers_generated::tag_storm_db::ImageArgs {
 						id: image.id.0 as u32,
 						hash: hash.as_ref(),
-						tags: tags,
+						tags,
 						attributes,
 					},
 				);

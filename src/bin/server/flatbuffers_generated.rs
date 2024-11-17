@@ -8,7 +8,7 @@ use core::{cmp::Ordering, mem};
 extern crate flatbuffers;
 use self::flatbuffers::{EndianScalar, Follow};
 
-#[allow(unused_imports, dead_code)]
+#[allow(unused_imports, dead_code, clippy::all)]
 pub mod tag_storm_db {
 
 	use core::{cmp::Ordering, mem};

@@ -38,6 +38,7 @@ pub fn parse_search(input: &str) -> Result<TreeQuery, pest::error::Error<Rule>> 
 }
 
 
+#[allow(dead_code)]
 fn format_parse_tree(pairs: pest::iterators::Pairs<Rule>, indent: usize) {
 	for pair in pairs {
 		let indent_str = "|    ".repeat(indent.saturating_sub(1)) + if indent > 0 { "|----" } else { "" };
