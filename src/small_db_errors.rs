@@ -1,5 +1,4 @@
-use std::{backtrace::Backtrace, fmt};
-use std::io::Error as IoError;
+use std::{backtrace::Backtrace, fmt, io::Error as IoError};
 
 
 // ============================================================================

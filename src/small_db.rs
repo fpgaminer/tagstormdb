@@ -1,21 +1,28 @@
 /// We need some database capabilities that are a bit more flexible than the append-only tables of the main database logic.
 /// This module implements a very simple database that is NOT append-only.
 /// Used for the user table, user tokens, work queues, etc.
-/// 
+///
 /// Format:
 /// - Each record is prefixed by a 4-byte length&active field, where the least significant bit is the active flag and the rest is the length of the record
 /// - The record data follows, serialized into a simple binary format and possibly padded
 /// - The record ends with a 2-byte checksum of the record data (not including the length&active field)
 /// - The database file is a sequence of these records
-/// 
+///
 /// The database is not append-only, so records can be updated and deleted. Deleted records are marked as inactive and their space can be reused by insert or update.
 /// On insert, empty space is found by searching for inactive records of the same or larger size. If no space is found, the record is appended to the end of the file.
 /// A WAL is written, to handle crashes. The WAL is replayed on startup to restore consistency.
 /// An update is like a delete followed by an insert, condensed into a single operation. The WAL contains both the deletion and the insertion.
-use std::{backtrace::Backtrace, collections::BTreeMap, fmt, fs::{File, OpenOptions}, io::{BufReader, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
+use std::{
+	backtrace::Backtrace,
+	collections::BTreeMap,
+	fmt,
+	fs::{File, OpenOptions},
+	io::{BufReader, Read, Seek, SeekFrom, Write},
+	path::{Path, PathBuf},
+};
 
 
-use byteorder::{LittleEndian, WriteBytesExt, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -71,7 +78,7 @@ pub fn debug_db<'a, T: Deserialize<'a> + fmt::Debug>(file: &mut File) {
 		}
 
 		// Sanity check, might need to be adjusted
-		if len > (32*1024*1024) {
+		if len > (32 * 1024 * 1024) {
 			println!("Record too long at position {}: {}", start_position, len);
 			return;
 		}
@@ -97,7 +104,10 @@ pub fn debug_db<'a, T: Deserialize<'a> + fmt::Debug>(file: &mut File) {
 			None
 		};
 
-		println!("Record at position {}: active={}, len={}, stored_checksum={}, computed_checksum={}, value={:?}", start_position, active, len, stored_checksum, computed_checksum, value);
+		println!(
+			"Record at position {}: active={}, len={}, stored_checksum={}, computed_checksum={}, value={:?}",
+			start_position, active, len, stored_checksum, computed_checksum, value
+		);
 	}
 }
 
@@ -142,7 +152,13 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 		let computed_checksum = (xxh3_64(&buffer[..len as usize - 2]) & 0xffff) as u16;
 
 		if stored_checksum != computed_checksum {
-			return Err(DbError::CorruptDatabase(format!("Checksum mismatch at position {}: stored={}, computed={}", start_position, stored_checksum, computed_checksum), Backtrace::capture()));
+			return Err(DbError::CorruptDatabase(
+				format!(
+					"Checksum mismatch at position {}: stored={}, computed={}",
+					start_position, stored_checksum, computed_checksum
+				),
+				Backtrace::capture(),
+			));
 		}
 
 		// Deserialize the record
@@ -156,7 +172,12 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 
 impl SmallDb {
 	pub fn open<T: DeserializeOwned>(path: &Path, callback: impl FnMut(RowId, T)) -> Result<SmallDb, DbError> {
-		let parent_dir = path.parent().ok_or_else(|| DbError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"), Backtrace::capture()))?;
+		let parent_dir = path.parent().ok_or_else(|| {
+			DbError::IoError(
+				std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"),
+				Backtrace::capture(),
+			)
+		})?;
 		let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
 
 		// Replay the WAL
@@ -280,7 +301,7 @@ impl SmallDb {
 		buffer[8..12].copy_from_slice(&(record_len + 4).to_le_bytes());
 		buffer[12..16].copy_from_slice(&((record_len << 1) | 1).to_le_bytes());
 		buffer[16..16 + record_bytes.len()].copy_from_slice(&record_bytes);
-		
+
 		let checksum = (xxh3_64(&buffer[16..16 + (record_len - 2) as usize]) & 0xffff) as u16;
 		buffer[buffer_len - 4..buffer_len - 2].copy_from_slice(&checksum.to_le_bytes());
 
@@ -295,7 +316,10 @@ impl SmallDb {
 
 		// Internal testing: simulate power failure
 		if self._internal_use_danger_do_not_use_wal_failure_test {
-			return Err(DbError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"), Backtrace::capture()));
+			return Err(DbError::IoError(
+				std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"),
+				Backtrace::capture(),
+			));
 		}
 
 		// Write the record and sync it
@@ -345,7 +369,7 @@ impl SmallDb {
 		// Read the old record length
 		self.file.seek(SeekFrom::Start(position.0))?;
 		let mut old_record_len_bytes = [0u8; 4];
-		self.file.read_exact(&mut old_record_len_bytes)?; 
+		self.file.read_exact(&mut old_record_len_bytes)?;
 		let old_record_len = u32::from_le_bytes(old_record_len_bytes) >> 1;
 
 		// Check if the new record fits in the old space
@@ -371,7 +395,7 @@ impl SmallDb {
 		buffer[12..16].copy_from_slice(&((new_record_len << 1) | 1).to_le_bytes());
 		buffer[16..16 + record_bytes.len()].copy_from_slice(&record_bytes);
 
-		let checksum = (xxh3_64(&buffer[16..16+(new_record_len - 2) as usize]) & 0xffff) as u16;
+		let checksum = (xxh3_64(&buffer[16..16 + (new_record_len - 2) as usize]) & 0xffff) as u16;
 		buffer[16 + new_record_len as usize - 2..16 + new_record_len as usize].copy_from_slice(&checksum.to_le_bytes());
 
 		// If we have an old record, add its deletion to the WAL
@@ -392,7 +416,10 @@ impl SmallDb {
 
 		// Internal testing: simulate power failure
 		if self._internal_use_danger_do_not_use_wal_failure_test {
-			return Err(DbError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"), Backtrace::capture()));
+			return Err(DbError::IoError(
+				std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"),
+				Backtrace::capture(),
+			));
 		}
 
 		// Write the new record
@@ -429,12 +456,19 @@ impl SmallDb {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs::OpenOptions, io::{Read, Seek, SeekFrom, Write}};
+	use std::{
+		collections::HashMap,
+		fs::OpenOptions,
+		io::{Read, Seek, SeekFrom, Write},
+	};
 
-    use rand::{seq::SliceRandom, Rng};
-    use serde::{Deserialize, Serialize};
+	use rand::{seq::SliceRandom, Rng};
+	use serde::{Deserialize, Serialize};
 
-    use crate::{small_db::{debug_db, SmallDb}, small_db_errors::DbError};
+	use crate::{
+		small_db::{debug_db, SmallDb},
+		small_db_errors::DbError,
+	};
 
 	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone)]
 	enum TestDataEnum {
@@ -485,7 +519,8 @@ mod tests {
 		{
 			let mut db = SmallDb::open(&tmpdir.path().join("test.db"), |_, _: TestData| {
 				unreachable!();
-			}).unwrap();
+			})
+			.unwrap();
 			let mut rng = rand::thread_rng();
 
 			for _ in 0..1024 {
@@ -522,7 +557,8 @@ mod tests {
 		let _ = SmallDb::open(&tmpdir.path().join("test.db"), |row_id, row: TestData| {
 			let expected_row = expected.remove(&row_id).unwrap();
 			assert_eq!(row, expected_row);
-		}).unwrap();
+		})
+		.unwrap();
 
 		// Check that all rows were visited
 		assert_eq!(expected.len(), 0);
@@ -538,7 +574,8 @@ mod tests {
 		let failed_row = {
 			let mut db = SmallDb::open(&tmpdir.path().join("test.db"), |_, _: TestData| {
 				unreachable!();
-			}).unwrap();
+			})
+			.unwrap();
 
 			let row = random_test_data();
 			let rowid1 = db.insert_row(&row).unwrap();
@@ -586,7 +623,8 @@ mod tests {
 
 				let expected_row = checked_rows.remove(&row_id).unwrap();
 				assert_eq!(row, expected_row);
-			}).unwrap();
+			})
+			.unwrap();
 		}
 
 		// Check that all rows were visited
@@ -600,7 +638,8 @@ mod tests {
 		let failed_row = {
 			let mut db = SmallDb::open(&tmpdir.path().join("test.db"), |rowid, _: TestData| {
 				println!("reading: rowid: {}:", rowid);
-			}).unwrap();
+			})
+			.unwrap();
 
 			let row = random_test_data();
 			let rowid1 = db.insert_row(&row).unwrap();
@@ -632,7 +671,8 @@ mod tests {
 
 				let expected_row = expected.remove(&row_id).expect(format!("Row not found: {}", row_id).as_str());
 				assert_eq!(row, expected_row);
-			}).unwrap();
+			})
+			.unwrap();
 		}
 
 		// Check that all rows were visited
@@ -673,7 +713,7 @@ mod tests {
 			file.read_to_end(&mut contents).unwrap();
 			// Flip some bits in the record data
 			contents[10] ^= 0xFF;
-			
+
 			// Write back the corrupted data
 			file.seek(SeekFrom::Start(0)).unwrap();
 			file.write_all(&contents).unwrap();
@@ -687,7 +727,7 @@ mod tests {
 
 		match result {
 			Ok(_) => panic!("Expected an error"),
-			Err(DbError::CorruptDatabase(_, _)) => {}
+			Err(DbError::CorruptDatabase(_, _)) => {},
 			Err(err) => panic!("Unexpected error: {:?}", err),
 		}
 	}

@@ -1,8 +1,11 @@
-use std::io::Write;
 use byteorder::{LittleEndian, WriteBytesExt};
 use serde::{ser, Serialize};
+use std::io::Write;
 
-use crate::{binary_format::{write_string, write_vli}, small_db_errors::SerializeError};
+use crate::{
+	binary_format::{write_string, write_vli},
+	small_db_errors::SerializeError,
+};
 
 
 pub struct Serializer {
@@ -15,11 +18,9 @@ type SerializerResult<T> = Result<T, SerializeError>;
 
 pub fn to_bytes<T>(value: &T) -> Result<Vec<u8>, SerializeError>
 where
-    T: Serialize,
+	T: Serialize,
 {
-	let mut serializer = Serializer {
-		output: Vec::new(),
-	};
+	let mut serializer = Serializer { output: Vec::new() };
 	value.serialize(&mut serializer)?;
 	Ok(serializer.output)
 }
@@ -127,34 +128,19 @@ impl<'a> ser::Serializer for &'a mut Serializer {
 		self.serialize_unit()
 	}
 
-	fn serialize_unit_variant(
-		self,
-		_name: &'static str,
-		variant_index: u32,
-		_variant: &'static str,
-	) -> SerializerResult<()> {
+	fn serialize_unit_variant(self, _name: &'static str, variant_index: u32, _variant: &'static str) -> SerializerResult<()> {
 		write_vli(&mut self.output, variant_index as u64).unwrap();
 		Ok(())
 	}
 
-	fn serialize_newtype_struct<T>(
-		self,
-		_name: &'static str,
-		value: &T,
-	) -> SerializerResult<()>
+	fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> SerializerResult<()>
 	where
 		T: ?Sized + Serialize,
 	{
 		value.serialize(self)
 	}
 
-	fn serialize_newtype_variant<T>(
-		self,
-		_name: &'static str,
-		variant_index: u32,
-		_variant: &'static str,
-		value: &T,
-	) -> SerializerResult<()>
+	fn serialize_newtype_variant<T>(self, _name: &'static str, variant_index: u32, _variant: &'static str, value: &T) -> SerializerResult<()>
 	where
 		T: ?Sized + Serialize,
 	{
@@ -171,11 +157,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
 		Ok(self)
 	}
 
-	fn serialize_tuple_struct(
-		self,
-		_name: &'static str,
-		len: usize,
-	) -> SerializerResult<Self::SerializeTupleStruct> {
+	fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> SerializerResult<Self::SerializeTupleStruct> {
 		self.serialize_seq(Some(len))
 	}
 
@@ -194,11 +176,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
 		unimplemented!()
 	}
 
-	fn serialize_struct(
-		self,
-		_name: &'static str,
-		_len: usize,
-	) -> SerializerResult<Self::SerializeStruct> {
+	fn serialize_struct(self, _name: &'static str, _len: usize) -> SerializerResult<Self::SerializeStruct> {
 		Ok(self)
 	}
 

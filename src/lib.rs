@@ -28,9 +28,9 @@ mod newtype_macros;
 pub mod binary_format;
 pub mod database;
 pub mod small_db;
-mod small_db_serializer;
 mod small_db_deserializer;
 mod small_db_errors;
+mod small_db_serializer;
 
 pub use database::Database;
 
