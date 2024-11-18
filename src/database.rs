@@ -2,23 +2,19 @@
 //! This module contains the database struct and all the methods to interact with it.
 use crate::{
 	binary_format::{
-		append_to_hash_table, append_to_log_file, append_to_strings_table, append_to_user_tokens_table, read_hash_table, read_log_file, read_string_table,
-		read_user_tokens_table, read_users_table, update_users_table, LogActionWithData, LogEntry, BAD_USER_ID,
-	},
-	default_progress_style,
-	errors::DatabaseError,
-	AttributeIndex, AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, NumericAttributeIndex, StringId, TagId, TagIndex,
-	UserId, UserToken,
+		append_to_hash_table, append_to_log_file, append_to_strings_table, read_hash_table, read_log_file, read_string_table, LogActionWithData, LogEntry,
+	}, default_progress_style, errors::DatabaseError, small_db::{RowId, SmallDb}, AttributeIndex, AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, NumericAttributeIndex, StringId, TagId, TagIndex, UserId, UserToken
 };
 use chrono::Utc;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
 use rand::{rngs::OsRng, Rng};
+use serde::{Deserialize, Serialize};
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	io::BufReader,
-	path::{Path, PathBuf},
+	path::Path,
 	sync::Arc,
 };
 use tokio::{
@@ -47,9 +43,10 @@ pub struct UserEntry {
 	pub hashed_login_key: HashedLoginKey,
 	pub scopes: String,
 	pub scopes_matcher: GlobSet,
+	pub row_id: RowId,
 }
 
-fn parse_scopes(scopes: &str) -> Result<GlobSet, DatabaseError> {
+pub fn parse_scopes(scopes: &str) -> Result<GlobSet, DatabaseError> {
 	let globs = scopes.split(',').map(|s| {
 		GlobBuilder::new(s.trim())
 			.literal_separator(true)
@@ -68,14 +65,21 @@ fn parse_scopes(scopes: &str) -> Result<GlobSet, DatabaseError> {
 }
 
 impl UserEntry {
-	pub(crate) fn new(hashed_login_key: HashedLoginKey, scopes: String) -> Result<Self, DatabaseError> {
+	pub(crate) fn new(hashed_login_key: HashedLoginKey, scopes: String, row_id: RowId) -> Result<Self, DatabaseError> {
 		let scopes_matcher = parse_scopes(&scopes)?;
 		Ok(Self {
 			hashed_login_key,
 			scopes,
 			scopes_matcher,
+			row_id,
 		})
 	}
+}
+
+#[derive(Deserialize, Serialize)]
+enum SmallDbEntry {
+	User { user_id: UserId, username: String, hashed_login_key: HashedLoginKey, scopes: String },
+	UserToken { user_id: UserId, token: UserToken },
 }
 
 
@@ -94,7 +98,7 @@ pub struct Database {
 	pub tags: RwLock<IndexMapTyped<String, TagEntry, TagId>>,
 	pub string_table: Arc<RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>>,
 	pub users: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
-	pub user_tokens: RwLock<HashMap<UserToken, UserId>>,
+	pub user_tokens: RwLock<HashMap<UserToken, (UserId, RowId)>>,
 
 	/// tag id -> images with that tag
 	pub index_by_tag: RwLock<TagIndex>,
@@ -104,12 +108,10 @@ pub struct Database {
 	pub index_by_attribute_numeric: RwLock<NumericAttributeIndex>,
 
 	/// Files
-	path: PathBuf,
 	logs_file: Arc<Mutex<std::fs::File>>,
 	hashes_file: Arc<Mutex<std::fs::File>>,
 	strings_file: Arc<Mutex<std::fs::File>>,
-	users_file: Arc<Mutex<std::fs::File>>,
-	user_tokens_file: Arc<Mutex<std::fs::File>>,
+	small_db: Arc<Mutex<SmallDb>>,
 }
 
 impl Database {
@@ -138,20 +140,6 @@ impl Database {
 				.truncate(false)
 				.open(path.join("logs.bin"))?;
 			// TODO: Exclusive lock
-			let users_file = std::fs::OpenOptions::new()
-				.create(true)
-				.read(true)
-				.write(true)
-				.truncate(false)
-				.open(path.join("users.bin"))?;
-			// TODO: Exclusive lock
-			let user_tokens_file = std::fs::OpenOptions::new()
-				.create(true)
-				.read(true)
-				.write(true)
-				.truncate(false)
-				.open(path.join("user_tokens.bin"))?;
-			// TODO: Exclusive lock
 
 			// Read image hashes
 			let start_time = std::time::Instant::now();
@@ -163,15 +151,12 @@ impl Database {
 			let string_table = read_string_table(BufReader::new(&strings_file), with_progress)?;
 			log::info!("Read string table with {} elements in {:?}", string_table.len(), start_time.elapsed());
 
-			// Read users table
+			// Read smalldb tables
 			let start_time = std::time::Instant::now();
-			let users = read_users_table(BufReader::new(&users_file), with_progress)?;
-			log::info!("Read users table with {} elements in {:?}", users.len(), start_time.elapsed());
-
-			// Read user tokens table
-			let start_time = std::time::Instant::now();
-			let user_tokens = read_user_tokens_table(BufReader::new(&user_tokens_file), with_progress)?;
-			log::info!("Read user tokens table with {} elements in {:?}", user_tokens.len(), start_time.elapsed());
+			let (users, user_tokens, small_db) = read_small_db(path.join("small_db.bin"))?;
+			log::info!("Read small db tables in {:?}", start_time.elapsed());
+			log::info!("Users: {}", users.len());
+			log::info!("User tokens: {}", user_tokens.len());
 
 			// Create the database object
 			let database = Self {
@@ -183,12 +168,10 @@ impl Database {
 				index_by_tag: RwLock::new(TagIndex::new()),
 				index_by_attribute: RwLock::new(AttributeIndex::new()),
 				index_by_attribute_numeric: RwLock::new(NumericAttributeIndex::new()),
-				path,
 				logs_file: Arc::new(Mutex::new(logs_file)),
 				hashes_file: Arc::new(Mutex::new(hashes_file)),
 				strings_file: Arc::new(Mutex::new(strings_file)),
-				users_file: Arc::new(Mutex::new(users_file)),
-				user_tokens_file: Arc::new(Mutex::new(user_tokens_file)),
+				small_db: Arc::new(Mutex::new(small_db)),
 			};
 
 			Ok(database)
@@ -311,7 +294,7 @@ impl Database {
 		// discovering up to 64-bits of the token.
 		// However, the timing is very noisy inside the server, reducing the signal, and
 		// even at 192-bits the tokens are still secure.
-		self.user_tokens.read().await.get(token).copied()
+		self.user_tokens.read().await.get(token).map(|(user_id, _)| *user_id)
 	}
 
 	pub async fn list_user_tokens_by_user_id(&self, user_id: UserId) -> Vec<UserToken> {
@@ -319,7 +302,7 @@ impl Database {
 			.read()
 			.await
 			.iter()
-			.filter_map(|(token, id)| if *id == user_id { Some(*token) } else { None })
+			.filter_map(|(token, (id, _))| if *id == user_id { Some(*token) } else { None })
 			.collect()
 	}
 
@@ -329,25 +312,29 @@ impl Database {
 
 	/// Add a new user to the database
 	pub async fn add_user(&self, username: String, hashed_login_key: HashedLoginKey, scopes: String) -> Result<UserId, DatabaseError> {
-		// Check that the scopes are valid by constructing the entry
-		let user_entry = UserEntry::new(hashed_login_key, scopes)?;
+		// Check that the scopes are valid
+		parse_scopes(&scopes)?;
 
 		// Lock the data structures
+		let mut small_db_lock = self.small_db.clone().lock_owned().await;
 		let mut users_lock = self.users.clone().write_owned().await;
-		let mut users_file = self.users_file.lock().await;
 
-		let entry = match users_lock.entry_by_key(username) {
+		let entry = match users_lock.entry_by_key(username.clone()) {
 			indexmap::map::Entry::Occupied(_) => return Err(DatabaseError::UserAlreadyExists),
 			indexmap::map::Entry::Vacant(entry) => entry,
 		};
 		let user_id: UserId = entry.index().into();
-		let _ = entry.insert(user_entry);
+		//let _ = entry.insert(user_entry);
 
-		// Write a new users table
-		let users_path = self.path.join("users.bin");
-		*users_file = task::spawn_blocking(move || update_users_table(&users_path, &users_lock))
+		// Insert into the small db
+		let db_entry = SmallDbEntry::User { user_id, username: username, hashed_login_key, scopes: scopes.clone() };
+		let row_id = task::spawn_blocking(move || small_db_lock.insert_row(&db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
+
+		// Insert into the users table
+		let user_entry = UserEntry::new(hashed_login_key, scopes, row_id)?;
+		let _ = entry.insert(user_entry);
 
 		Ok(user_id)
 	}
@@ -359,23 +346,27 @@ impl Database {
 
 		// Lock the data structures
 		let mut users = self.users.clone().write_owned().await;
-		let mut users_file = self.users_file.lock().await;
+		let mut small_db_lock = self.small_db.clone().lock_owned().await;
 
 		// Find the user
-		let user = match users.get_by_id_mut(user_id) {
+		let (username, user) = match users.get_by_id_full_mut(user_id) {
 			Some(user) => user,
 			None => return Err(DatabaseError::UserDoesNotExist),
 		};
 
 		// Update state
-		user.scopes = new_scopes;
+		user.scopes = new_scopes.clone();
 		user.scopes_matcher = parsed_scopes;
 
-		// Write a new users table
-		let users_path = self.path.join("users.bin");
-		*users_file = task::spawn_blocking(move || update_users_table(&users_path, &users))
+		// Update the small db
+		let old_row_id = user.row_id;
+		let db_entry = SmallDbEntry::User { user_id, username: username.clone(), hashed_login_key: user.hashed_login_key, scopes: new_scopes };
+		let new_row_id = task::spawn_blocking(move || small_db_lock.update_row(old_row_id, &db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
+
+		// Update rowid
+		user.row_id = new_row_id;
 
 		Ok(())
 	}
@@ -384,10 +375,10 @@ impl Database {
 	pub async fn change_user_login_key(&self, user_id: UserId, new_hashed_login_key: HashedLoginKey) -> Result<(), DatabaseError> {
 		// Lock the data structures
 		let mut users = self.users.clone().write_owned().await;
-		let mut users_file = self.users_file.lock().await;
+		let mut small_db_lock = self.small_db.clone().lock_owned().await;
 
 		// Find the user
-		let user = match users.get_by_id_mut(user_id) {
+		let (username, user) = match users.get_by_id_full_mut(user_id) {
 			Some(user) => user,
 			None => return Err(DatabaseError::UserDoesNotExist),
 		};
@@ -395,11 +386,15 @@ impl Database {
 		// Update state
 		user.hashed_login_key = new_hashed_login_key;
 
-		// Write a new users table
-		let users_path = self.path.join("users.bin");
-		*users_file = task::spawn_blocking(move || update_users_table(&users_path, &users))
+		// Update the small db
+		let old_row_id = user.row_id;
+		let db_entry = SmallDbEntry::User { user_id, username: username.clone(), hashed_login_key: new_hashed_login_key, scopes: user.scopes.clone() };
+		let new_row_id = task::spawn_blocking(move || small_db_lock.update_row(old_row_id, &db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
+
+		// Update rowid
+		user.row_id = new_row_id;
 
 		Ok(())
 	}
@@ -408,7 +403,7 @@ impl Database {
 	pub async fn create_user_token(&self, user_id: UserId) -> Result<UserToken, DatabaseError> {
 		// Lock the data structures
 		let mut user_tokens = self.user_tokens.write().await;
-		let mut user_tokens_file = self.user_tokens_file.clone().lock_owned().await;
+		let mut small_db_lock = self.small_db.clone().lock_owned().await;
 		let users = self.users.read().await;
 
 		// Check that the user exists
@@ -419,13 +414,14 @@ impl Database {
 		// Generate a new token
 		let token: UserToken = OsRng.gen();
 
-		// Update state
-		user_tokens.insert(token, user_id);
-
-		// Update file
-		task::spawn_blocking(move || append_to_user_tokens_table(&mut user_tokens_file, token, user_id))
+		// Update the small db
+		let db_entry = SmallDbEntry::UserToken { user_id, token };
+		let row_id = task::spawn_blocking(move || small_db_lock.insert_row(&db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
+
+		// Update state
+		user_tokens.insert(token, (user_id, row_id));
 
 		Ok(token)
 	}
@@ -433,14 +429,16 @@ impl Database {
 	pub async fn invalidate_user_token(&self, token: &UserToken) -> Result<(), DatabaseError> {
 		// Lock the data structures
 		let mut user_tokens = self.user_tokens.write().await;
-		let mut user_tokens_file = self.user_tokens_file.clone().lock_owned().await;
+		let mut small_db_lock = self.small_db.clone().lock_owned().await;
 
 		// Remove from state
-		user_tokens.remove(token);
+		let (_, row_id) = match user_tokens.remove(token) {
+			Some(v) => v,
+			None => return Ok(()),
+		};
 
-		// Update file
-		let token = *token;
-		task::spawn_blocking(move || append_to_user_tokens_table(&mut user_tokens_file, token, BAD_USER_ID))
+		// Update the small db
+		task::spawn_blocking(move || small_db_lock.delete_row(row_id))
 			.await
 			.expect("spawn_blocking failed")?;
 
@@ -1159,4 +1157,36 @@ pub enum StateUpdateResult<T> {
 	NoOp,
 	ErrorImageDoesNotExist,
 	ErrorTagDoesNotExist,
+}
+
+
+fn read_small_db<P: AsRef<Path>>(path: P) -> Result<(IndexMapTyped<String, UserEntry, UserId>, HashMap<UserToken, (UserId, RowId)>, SmallDb), DatabaseError> {
+	let mut users = BTreeMap::new();   //: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
+	let mut user_tokens = HashMap::new();   //<UserToken, UserId>>,
+
+	let small_db = SmallDb::open(path.as_ref(), |row_id, row: SmallDbEntry| {
+		match row {
+			SmallDbEntry::User { user_id, username, hashed_login_key, scopes } => {
+				users.insert(user_id, (username, UserEntry::new(hashed_login_key, scopes, row_id)));
+			},
+			SmallDbEntry::UserToken { token, user_id } => {
+				user_tokens.insert(token, (user_id, row_id));
+			},
+		}
+	})?;
+
+	// Build the index map
+	let mut users_indexmap = IndexMapTyped::new();
+
+	for (user_id, (username, user_entry)) in users.into_iter() {
+		let user_entry = user_entry?;
+
+		if user_id != UserId(users_indexmap.len() as u64) {
+			panic!("User IDs are not contiguous");
+		}
+
+		users_indexmap.insert(username, user_entry);
+	}
+
+	Ok((users_indexmap, user_tokens, small_db))
 }

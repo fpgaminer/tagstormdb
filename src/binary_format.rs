@@ -69,25 +69,19 @@
 use std::{
 	collections::HashMap,
 	fs::File,
-	io::{BufWriter, Read, Seek, Write},
-	path::Path,
+	io::{Read, Seek, Write},
 };
 
 use crate::{
-	database::{ImageEntry, UserEntry},
+	database::ImageEntry,
 	default_progress_style,
 	errors::DatabaseError,
-	AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, StringId, TagId, UserId, UserToken,
+	AttributeKeyId, AttributeValueId, ImageHash, ImageId, IndexMapTyped, StringId, TagId, UserId,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
-use tempfile::NamedTempFile;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
-
-
-/// Used as a sigil value in some cases
-pub(crate) const BAD_USER_ID: UserId = UserId(u64::MAX);
 
 
 /// Wraps a reader to calculate hashes on the fly
@@ -499,212 +493,6 @@ pub(crate) fn append_to_hash_table(file: &mut File, image_hash: &ImageHash) -> R
 }
 
 
-// =============================================
-// Users table
-// =============================================
-
-/// Read the user table
-/// Unlike the other tables, the user table is more primitive and is not append only.
-/// Durability is handled through entire file replacement, so no complex recovery is needed.
-pub fn read_users_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> Result<IndexMapTyped<String, UserEntry, UserId>, DatabaseError> {
-	// Read count
-	reader.seek(std::io::SeekFrom::Start(0))?;
-	let num_users = match reader.read_u64::<LittleEndian>() {
-		Ok(num_users) => num_users as usize,
-		Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(IndexMapTyped::new()), // Empty file
-		Err(e) => return Err(e.into()),
-	};
-
-	// Read users
-	let mut table = IndexMapTyped::with_capacity(num_users);
-	let mut reader = HasherReader::new(reader, Xxh3::new());
-	let pb_target = if with_progress {
-		ProgressDrawTarget::stderr()
-	} else {
-		ProgressDrawTarget::hidden()
-	};
-	let pb = ProgressBar::with_draw_target(Some(num_users as u64), pb_target)
-		.with_prefix("Reading users")
-		.with_style(default_progress_style());
-
-	for _ in 0..num_users {
-		// Reset the hasher
-		reader.reset();
-
-		// Username
-		let username = match read_string(&mut reader) {
-			Ok(username) => username,
-			Err(DatabaseError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break, // EOF
-			Err(e) => return Err(e),
-		};
-
-		// Login key hash
-		let mut hashed_login_key = HashedLoginKey([0u8; 32]);
-		reader.read_exact(&mut hashed_login_key.0)?;
-
-		// Scopes
-		let scopes = read_string(&mut reader)?;
-
-		// Checksum
-		let calculated_checksum = (reader.digest() & 0xffff) as u16;
-		let stored_checksum = reader.read_u16::<LittleEndian>()?;
-
-		if calculated_checksum != stored_checksum {
-			return Err(DatabaseError::ChecksumMismatch {
-				expected: calculated_checksum as u64,
-				actual: stored_checksum as u64,
-			});
-		}
-
-		table.insert(username, UserEntry::new(hashed_login_key, scopes)?);
-		pb.inc(1);
-	}
-
-	Ok(table)
-}
-
-
-/// Write a user table to a file
-/// See notes under `read_users_table` for durability considerations
-pub(crate) fn write_users_table(file: &mut File, users: &IndexMapTyped<String, UserEntry, UserId>) -> Result<(), DatabaseError> {
-	{
-		let mut writer = BufWriter::new(&mut *file);
-
-		// Write count
-		writer.write_u64::<LittleEndian>(users.len() as u64)?;
-
-		// Write users
-		let mut buffer = Vec::new();
-		for (username, user) in users.iter() {
-			// Reset the buffer
-			buffer.clear();
-
-			// Write username
-			write_string(&mut buffer, username).expect("in-memory buffer should not fail");
-
-			// Write login key hash
-			std::io::Write::write_all(&mut buffer, &user.hashed_login_key.0).expect("in-memory buffer should not fail");
-
-			// Write scopes
-			write_string(&mut buffer, &user.scopes).expect("in-memory buffer should not fail");
-
-			// Write checksum
-			let checksum = (xxh3_64(&buffer) & 0xffff) as u16;
-			buffer.write_u16::<LittleEndian>(checksum).expect("in-memory buffer should not fail");
-
-			// Write the buffer to the file
-			writer.write_all(&buffer)?;
-		}
-
-		// Flush
-		writer.flush()?;
-	}
-
-	// Durably sync
-	file.sync_all()?;
-
-	Ok(())
-}
-
-
-/// Update users table file
-/// Writes the updated version to a temporary file
-/// And then atomically swaps it with the original file
-pub(crate) fn update_users_table(dest_path: &Path, users: &IndexMapTyped<String, UserEntry, UserId>) -> Result<File, DatabaseError> {
-	let mut tmp_file = NamedTempFile::new_in(dest_path.parent().expect("Users table file should have a parent directory"))?;
-
-	// Write the updated table to the temporary file
-	write_users_table(tmp_file.as_file_mut(), users)?;
-
-	// Sync
-	tmp_file.as_file_mut().sync_all()?;
-
-	// Replace the original file with the temporary file
-	let file = tmp_file.persist(dest_path).map_err(|e| DatabaseError::IoError(e.error))?;
-
-	// TODO: Exclusive lock
-
-	Ok(file)
-}
-
-
-// =============================================
-// User tokens table
-// =============================================
-
-/// Read user tokens table from a file
-pub(crate) fn read_user_tokens_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> Result<HashMap<UserToken, UserId>, DatabaseError> {
-	// Calculate the number of tokens
-	let file_length = reader.seek(std::io::SeekFrom::End(0))?;
-
-	if file_length % 41 != 0 {
-		log::warn!("Warning: user tokens table file length is not a multiple of 41. This may indicate corruption.");
-	}
-
-	let num_tokens = (file_length / 41) as usize;
-	reader.seek(std::io::SeekFrom::Start(0))?;
-
-	// Read hashes
-	let mut table = HashMap::with_capacity(num_tokens);
-	let mut buffer = [0u8; 41];
-	let pb_target = if with_progress {
-		ProgressDrawTarget::stderr()
-	} else {
-		ProgressDrawTarget::hidden()
-	};
-	let pb = ProgressBar::with_draw_target(Some(num_tokens as u64), pb_target)
-		.with_prefix("Reading user tokens")
-		.with_style(default_progress_style());
-	pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-	for _ in 0..num_tokens {
-		// Read user token and user_id
-		reader.read_exact(&mut buffer)?;
-		let user_token = UserToken(buffer[0..32].try_into().unwrap());
-		let user_id = UserId(u64::from_le_bytes(buffer[32..40].try_into().unwrap()));
-		let stored_checksum = buffer[40];
-		let calculated_checksum = (xxh3_64(&buffer[0..40]) & 0xff) as u8;
-
-		if calculated_checksum != stored_checksum {
-			return Err(DatabaseError::ChecksumMismatch {
-				expected: calculated_checksum as u64,
-				actual: stored_checksum as u64,
-			});
-		}
-
-		pb.inc(1);
-
-		if user_id == BAD_USER_ID {
-			// Sigil for a token that has been invalidated
-			table.remove(&user_token);
-			continue;
-		}
-
-		table.insert(user_token, user_id);
-	}
-
-	Ok(table)
-}
-
-
-/// Append to the user tokens table
-pub(crate) fn append_to_user_tokens_table(file: &mut File, user_token: UserToken, user_id: UserId) -> Result<(), DatabaseError> {
-	// Write user token and user_id
-	let mut buffer = [0u8; 41];
-	buffer[0..32].copy_from_slice(&user_token.0);
-	buffer[32..40].copy_from_slice(&user_id.0.to_le_bytes());
-	buffer[40] = (xxh3_64(&buffer[0..40]) & 0xff) as u8;
-
-	file.seek(std::io::SeekFrom::End(0))?;
-	file.write_all(&buffer)?;
-
-	// Durably sync
-	file.sync_all()?;
-
-	Ok(())
-}
-
-
 // =============================================================================
 // ===== Log file
 // =============================================================================
@@ -1103,40 +891,6 @@ mod tests {
 		assert!(result.is_err());
 	}
 
-	/// Test corruption detection in the users table
-	#[test]
-	fn test_users_table_corruption() {
-		let mut file = tempfile::tempfile().unwrap();
-
-		let mut users = IndexMapTyped::new();
-		users.insert("test".to_string(), UserEntry::new(HashedLoginKey([0u8; 32]), "test".to_string()).unwrap());
-		write_users_table(&mut file, &users).unwrap();
-
-		// Corrupt the file
-		file.seek(std::io::SeekFrom::End(-2)).unwrap();
-		file.write_u16::<LittleEndian>(0xbeef).unwrap();
-
-		// Read the users table
-		let result = read_users_table(BufReader::new(file), false);
-		assert!(result.is_err());
-	}
-
-	/// Test corruption detection in the user tokens table
-	#[test]
-	fn test_user_tokens_table_corruption() {
-		let mut file = tempfile::tempfile().unwrap();
-
-		append_to_user_tokens_table(&mut file, UserToken([0u8; 32]), UserId(42)).unwrap();
-
-		// Corrupt the file
-		file.seek(std::io::SeekFrom::End(-5)).unwrap();
-		file.write_u32::<LittleEndian>(0xdeadbeef).unwrap();
-
-		// Read the user tokens table
-		let result = read_user_tokens_table(&mut file, false);
-		assert!(result.is_err());
-	}
-
 	/// Test corruption detection in the log file
 	#[test]
 	fn test_log_file_corruption() {
@@ -1211,53 +965,6 @@ mod tests {
 		assert_eq!(*table.get_by_id_full(2u64.into()).unwrap().0, hash3);
 	}
 
-	/// Test writing to and reading from the users table
-	#[test]
-	fn test_write_and_read_users_table() {
-		let mut file = tempfile::tempfile().unwrap();
-
-		let mut users = IndexMapTyped::new();
-		users.insert("user1".to_string(), UserEntry::new(HashedLoginKey([1u8; 32]), "scope1".to_string()).unwrap());
-		users.insert("user2".to_string(), UserEntry::new(HashedLoginKey([2u8; 32]), "scope2".to_string()).unwrap());
-		users.insert("user3".to_string(), UserEntry::new(HashedLoginKey([3u8; 32]), "scope3".to_string()).unwrap());
-
-		// Write the users table
-		write_users_table(&mut file, &users).unwrap();
-
-		// Read the users table
-		let read_users = read_users_table(&mut file, false).unwrap();
-
-		// Verify the contents
-		assert_eq!(read_users.len(), 3);
-		assert_eq!(read_users.get_by_id_full(UserId(0)).unwrap().0, "user1");
-		assert_eq!(read_users.get_by_id_full(UserId(1)).unwrap().0, "user2");
-		assert_eq!(read_users.get_by_id_full(UserId(2)).unwrap().0, "user3");
-	}
-
-	/// Test appending to and reading from the user tokens table
-	#[test]
-	fn test_append_and_read_user_tokens_table() {
-		let mut file = tempfile::tempfile().unwrap();
-
-		let token1 = UserToken([1u8; 32]);
-		let token2 = UserToken([2u8; 32]);
-		let token3 = UserToken([3u8; 32]);
-
-		// Append user tokens to the table
-		append_to_user_tokens_table(&mut file, token1, UserId(1)).unwrap();
-		append_to_user_tokens_table(&mut file, token2, UserId(2)).unwrap();
-		append_to_user_tokens_table(&mut file, token3, UserId(3)).unwrap();
-
-		// Read the user tokens table
-		let tokens = read_user_tokens_table(&mut file, false).unwrap();
-
-		// Verify the contents
-		assert_eq!(tokens.len(), 3);
-		assert_eq!(tokens.get(&token1), Some(&UserId(1)));
-		assert_eq!(tokens.get(&token2), Some(&UserId(2)));
-		assert_eq!(tokens.get(&token3), Some(&UserId(3)));
-	}
-
 	/// Test appending to and reading from the log file
 	#[test]
 	fn test_append_and_read_log_file() {
@@ -1293,32 +1000,6 @@ mod tests {
 		assert_eq!(logs[0].timestamp, log_entry1.timestamp);
 		assert_eq!(logs[1].timestamp, log_entry2.timestamp);
 		assert_eq!(logs[2].timestamp, log_entry3.timestamp);
-	}
-
-	/// Test updating the users table with update_users_table function
-	#[test]
-	fn test_update_users_table() {
-		let temp_dir = tempfile::tempdir().unwrap();
-		let mut file = File::create(temp_dir.path().join("users_table")).unwrap();
-
-		let mut users = IndexMapTyped::new();
-		users.insert("user1".to_string(), UserEntry::new(HashedLoginKey([1u8; 32]), "scope1".to_string()).unwrap());
-
-		// Write the initial users table
-		write_users_table(&mut file, &users).unwrap();
-
-		// Update the users table
-		users.insert("user2".to_string(), UserEntry::new(HashedLoginKey([2u8; 32]), "scope2".to_string()).unwrap());
-
-		let file = update_users_table(&temp_dir.path().join("users_table"), &users).unwrap();
-
-		// Read back the users table
-		let read_users = read_users_table(&file, false).unwrap();
-
-		// Verify the contents
-		assert_eq!(read_users.len(), 2);
-		assert!(read_users.contains_key("user1"));
-		assert!(read_users.contains_key("user2"));
 	}
 
 	/// Test LogsReader iterator with multiple log entries
@@ -1379,16 +1060,6 @@ mod tests {
 		// Empty hash table
 		let file = tempfile::tempfile().unwrap();
 		let table = read_hash_table(&file, false).unwrap();
-		assert!(table.is_empty());
-
-		// Empty users table
-		let file = tempfile::tempfile().unwrap();
-		let table = read_users_table(&file, false).unwrap();
-		assert!(table.is_empty());
-
-		// Empty user tokens table
-		let file = tempfile::tempfile().unwrap();
-		let table = read_user_tokens_table(&file, false).unwrap();
 		assert!(table.is_empty());
 
 		// Empty log file
@@ -1457,27 +1128,6 @@ mod tests {
 		// Read the strings table
 		let table = read_string_table(&mut file, false).unwrap();
 		assert_eq!(table.len(), 2);
-	}
-
-	/// Test invalidating user tokens
-	#[test]
-	fn test_invalidate_user_tokens() {
-		let mut file = tempfile::tempfile().unwrap();
-
-		let token = UserToken([1u8; 32]);
-		let user_id = UserId(42);
-
-		// Append user token
-		append_to_user_tokens_table(&mut file, token, user_id).unwrap();
-
-		// Invalidate the token by writing BAD_USER_ID
-		append_to_user_tokens_table(&mut file, token, BAD_USER_ID).unwrap();
-
-		// Read the user tokens table
-		let tokens = read_user_tokens_table(&mut file, false).unwrap();
-
-		// Verify that the token has been removed
-		assert!(tokens.get(&token).is_none());
 	}
 
 	/// Test adding and removing attributes in log entries

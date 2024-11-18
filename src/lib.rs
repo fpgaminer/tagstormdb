@@ -125,6 +125,27 @@ impl ::std::cmp::PartialEq for HashedLoginKey {
 
 impl Eq for HashedLoginKey {}
 
+impl Serialize for HashedLoginKey {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_str(&hex::encode(self.0))
+	}
+}
+
+impl<'de> Deserialize<'de> for HashedLoginKey {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		let mut bytes = [0u8; 32];
+		hex::decode_to_slice(s, &mut bytes).map_err(serde::de::Error::custom)?;
+		Ok(HashedLoginKey(bytes))
+	}
+}
+
 
 #[derive(Debug, Clone, Copy)]
 pub struct UserToken(pub [u8; 32]);
@@ -218,6 +239,10 @@ where
 
 	pub fn get_by_id_full(&self, id: I) -> Option<(&K, &V)> {
 		self.map.get_index(id.into())
+	}
+
+	pub fn get_by_id_full_mut(&mut self, id: I) -> Option<(&K, &mut V)> {
+		self.map.get_index_mut(id.into())
 	}
 
 	pub fn get_by_key(&self, key: &K) -> Option<&V> {

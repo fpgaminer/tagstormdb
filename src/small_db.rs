@@ -26,7 +26,9 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::{small_db_deserializer::from_bytes, small_db_errors::DbError, small_db_serializer::to_bytes};
+use crate::{small_db_deserializer::from_bytes, small_db_serializer::to_bytes};
+
+pub use crate::small_db_errors::DbError;
 
 
 pub struct SmallDb {
@@ -179,6 +181,7 @@ impl SmallDb {
 			)
 		})?;
 		let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+		// TODO: Exclusively lock the file
 
 		// Replay the WAL
 		SmallDb::play_wal(&mut file, parent_dir)?;
@@ -507,6 +510,41 @@ mod tests {
 			s.push(rng.gen())
 		}
 		s
+	}
+
+	/// Test serialization and deserialization
+	#[test]
+	fn serialization_test() {
+		#[derive(Serialize, Deserialize, Debug, PartialEq)]
+		enum ComplicatedEnum {
+			A((i16, u64)),
+			B(String),
+			C { a: i32, b: String },
+		}
+
+		#[derive(Serialize, Deserialize, Debug, PartialEq)]
+		struct Complicated {
+			a: i8,
+			b: String,
+			c: Vec<TestDataEnum>,
+			d: ComplicatedEnum,
+		}
+
+		let test_data = vec![Complicated {
+			a: 42,
+			b: "Hello, world!".to_string(),
+			c: vec![TestDataEnum::A(88), TestDataEnum::B("Hello, world!".to_string())],
+			d: ComplicatedEnum::C { a: 19, b: "Hello, world!".to_string() },
+		}, Complicated {
+			a: 3,
+			b: "Hello, doggy!".to_string(),
+			c: vec![TestDataEnum::B("How fancy".to_string())],
+			d: ComplicatedEnum::A((-42, 0xdeadbeef)),
+		}];
+		let serialized = crate::small_db_serializer::to_bytes(&test_data).unwrap();
+		let deserialized: Vec<Complicated> = crate::small_db_deserializer::from_bytes(&serialized).unwrap();
+
+		assert_eq!(test_data, deserialized);
 	}
 
 	/// Test SmallDb by inserting, updating, and deleting random rows

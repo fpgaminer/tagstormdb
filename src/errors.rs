@@ -1,3 +1,5 @@
+use crate::small_db;
+
 #[derive(Debug)]
 pub enum DatabaseError {
 	IoError(std::io::Error),
@@ -8,6 +10,7 @@ pub enum DatabaseError {
 	ScopeParseError(globset::Error),
 	UserAlreadyExists,
 	UserDoesNotExist,
+	SmallDbError(small_db::DbError),
 }
 
 impl From<std::io::Error> for DatabaseError {
@@ -22,6 +25,12 @@ impl From<std::string::FromUtf8Error> for DatabaseError {
 	}
 }
 
+impl From<small_db::DbError> for DatabaseError {
+	fn from(e: small_db::DbError) -> Self {
+		Self::SmallDbError(e)
+	}
+}
+
 impl std::fmt::Display for DatabaseError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
@@ -33,6 +42,7 @@ impl std::fmt::Display for DatabaseError {
 			Self::ScopeParseError(e) => write!(f, "Scope parse error: {}", e),
 			Self::UserAlreadyExists => write!(f, "User already exists"),
 			Self::UserDoesNotExist => write!(f, "User does not exist"),
+			Self::SmallDbError(e) => write!(f, "SmallDbError: {}", e),
 		}
 	}
 }

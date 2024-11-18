@@ -24,7 +24,7 @@ use actix_web::{
 	App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use anyhow::Context;
-use auth::AuthenticatedUser;
+use auth::{AuthenticatedUser, Scope};
 use clap::Parser;
 use data_encoding::BASE32;
 use env_logger::Env;
@@ -32,13 +32,14 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use flatbuffers_generated::tag_storm_db as flatbuffer_types;
 use hmac::{Hmac, Mac};
 use image::{imageops, ImageReader};
+use rand::{rngs::OsRng, seq::SliceRandom};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use server_error::ServerError;
 use sha2::{Digest, Sha256, Sha512};
 use tags::TagMappings;
 use tagstormdb::{
-	database::{ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock},
+	database::{parse_scopes, ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock},
 	errors::DatabaseError,
 	search::TreeSort,
 	AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId, UserId, UserToken,
@@ -47,10 +48,6 @@ use tokio::io::AsyncReadExt;
 
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
-
-// Can see their own user info, can change their own login key, can use imgops
-// Notably missing: can't create a user token for themselves, i.e. can't log in
-const DEFAULT_USER_SCOPES: &str = "users/{id}/info, users/{id}/login_key/change, images/imgops-upload";
 
 
 #[derive(Parser, Debug)]
@@ -79,6 +76,20 @@ struct Args {
 	/// Path to the server secrets file.
 	#[arg(long, default_value = "db/secrets.json")]
 	secrets_path: PathBuf,
+
+	// Can see their own user info, can change their own login key, can use imgops, can list their own user tokens, can invalidate their own user tokens
+	// Notably missing: can't create a user token for themselves, i.e. can't log in
+	/// Default user scopes.
+	#[arg(long, default_value = "get/users/{id}, post/users/{id}/login_key, post/images/imgops, get/users/{id}/tokens, delete/users/{id}/tokens")]
+	default_user_scopes: String,
+
+	/// If the user table is empty, create a default admin user with the given username.
+	#[arg(long, default_value = "admin")]
+	admin_user: String,
+
+	/// If the user table is empty, create a default admin user with the given scopes.
+	#[arg(long, default_value = "post/users/*/scopes, get/users/*, */images/tags, */images/attributes, post/images/imgops, post/upload_image, post/users/*/tokens")]
+	admin_scopes: String,
 }
 
 
@@ -87,6 +98,7 @@ struct ServerData {
 	image_dir: PathBuf,
 	upload_dir: PathBuf,
 	server_secrets: ServerSecrets,
+	default_user_scopes: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -115,11 +127,31 @@ async fn main() -> Result<(), anyhow::Error> {
 	// Load server secrets
 	let server_secrets = load_server_secrets(&args.secrets_path).await?;
 
+	// Make sure default user scopes are valid
+	if parse_scopes(&args.default_user_scopes).is_err() {
+		return Err(anyhow::anyhow!("Invalid default user scopes"));
+	}
+
+	// Make sure admin scopes are valid
+	if parse_scopes(&args.admin_scopes).is_err() {
+		return Err(anyhow::anyhow!("Invalid admin scopes"));
+	}
+
+	// Make an admin user if the user table is empty
+	if database.users.read().await.is_empty() {
+		let admin_password = random_password();
+		let admin_login_key = login_key_from_password(&args.admin_user, &admin_password);
+		let admin_hashed_login_key = admin_login_key.hash();
+		let admin_user_id = database.add_user(args.admin_user, admin_hashed_login_key, args.admin_scopes).await?;
+		log::warn!("Created admin user with ID {} and password {}", admin_user_id, admin_password);
+	}
+
 	// Setup HTTP server
 	let server_data = ServerData {
 		image_dir: args.image_dir,
 		upload_dir: args.upload_dir,
 		server_secrets,
+		default_user_scopes: args.default_user_scopes,
 	};
 
 	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone()))
@@ -192,6 +224,7 @@ fn build_app(
 		.service(imgops_upload)
 		.service(create_user)
 		.service(get_cf_turnstile_key)
+		.service(list_users)
 }
 
 
@@ -231,9 +264,7 @@ async fn get_tag_mappings(tag_mappings: Data<TagMappings>, _user: AuthenticatedU
 #[actix_web::post("/tags/{name}")]
 async fn add_tag(db: Data<Arc<Database>>, path: web::Path<(String,)>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("tags/add") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: tags/add"));
-	}
+	user.verify_scope(Scope::TagsAdd)?;
 
 	let (tag_name,) = path.into_inner();
 
@@ -251,9 +282,7 @@ async fn add_tag(db: Data<Arc<Database>>, path: web::Path<(String,)>, user: Auth
 #[actix_web::delete("/tags/{name}")]
 async fn remove_tag(db: Data<Arc<Database>>, path: web::Path<(String,)>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("tags/remove") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: tags/remove"));
-	}
+	user.verify_scope(Scope::TagsRemove)?;
 
 	let (tag_name,) = path.into_inner();
 	let tag_id = match db.get_tag_id(&tag_name).await {
@@ -399,9 +428,7 @@ async fn add_image(
 	user: AuthenticatedUser,
 ) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/add") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/add"));
-	}
+	user.verify_scope(Scope::ImagesAdd)?;
 
 	let (hash,) = path.into_inner();
 	let hash_str = hex::encode(hash.0);
@@ -445,9 +472,7 @@ async fn add_image(
 #[actix_web::delete("/images/{identifier}")]
 async fn remove_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier,)>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/remove") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/remove"));
-	}
+	user.verify_scope(Scope::ImagesRemove)?;
 
 	let (identifier,) = path.into_inner();
 	let images_lock = db.images.read().await;
@@ -474,9 +499,7 @@ async fn remove_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier,
 #[actix_web::post("/images/{image}/tags/{tag}")]
 async fn tag_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier, TagIdentifier)>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/tags/add") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/tags/add"));
-	}
+	user.verify_scope(Scope::ImagesTagsAdd)?;
 
 	let (image, tag) = path.into_inner();
 	let image_id = match image {
@@ -519,9 +542,7 @@ async fn tag_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier, Ta
 #[actix_web::delete("/images/{image}/tags/{tag}")]
 async fn untag_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier, TagIdentifier)>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/tags/remove") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/tags/remove"));
-	}
+	user.verify_scope(Scope::ImagesTagsRemove)?;
 
 	let (image, tag) = path.into_inner();
 	let image_id = match image {
@@ -568,9 +589,7 @@ async fn add_image_attribute(
 	user: AuthenticatedUser,
 ) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/attributes/add") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/attributes/add"));
-	}
+	user.verify_scope(Scope::ImagesAttributesAdd)?;
 
 	let (image, key, value, singular) = path.into_inner();
 	let image_id = match image {
@@ -613,9 +632,7 @@ async fn remove_image_attribute(
 	user: AuthenticatedUser,
 ) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/attributes/remove") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/attributes/remove"));
-	}
+	user.verify_scope(Scope::ImagesAttributesRemove)?;
 
 	let (image, key, value) = path.into_inner();
 	let image_id = match image {
@@ -672,9 +689,15 @@ async fn login(db: Data<Arc<Database>>, query: web::Json<LoginQuery>) -> Result<
 	let (_, user) = db
 		.get_user_by_id(user_id, &users)
 		.ok_or_else(|| anyhow::anyhow!("User not found after authentication"))?;
-	let scope = format!("users/{}/tokens/create", user_id);
-	if !user.scopes_matcher.is_match(&scope) {
-		return Ok(HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)));
+
+	{
+		// Need a temporary AuthenticatedUser to check permissions
+		// Don't want it to live too long since technically the user isn't "Authenticated" (only user tokens can be Authenticated)
+		let user = AuthenticatedUser {
+			id: user_id,
+			scope_matcher: user.scopes_matcher.clone(),
+		};
+		user.verify_scope(Scope::UsersTokensCreate(user_id))?;
 	}
 
 	// Create a new user token
@@ -701,10 +724,8 @@ async fn invalidate_user_token(db: Data<Arc<Database>>, query: web::Json<Invalid
 		None => return Ok(HttpResponse::NotFound().body("Token not found")),
 	};
 
-	// Make sure the user is invalidating their own token
-	if token_user_id != user.id {
-		return Ok(HttpResponse::Forbidden().body("Token not found"));
-	}
+	// Check permissions
+	user.verify_scope(Scope::UsersTokensDelete(token_user_id))?;
 
 	db.invalidate_user_token(&query.token).await?;
 
@@ -727,6 +748,7 @@ async fn change_login_key(
 ) -> Result<HttpResponse, ServerError> {
 	let (query_user,) = path.into_inner();
 
+	// Parse user ID
 	let user_id = match query_user.as_str() {
 		"me" => user.id,
 		s => match s.parse().map(UserId) {
@@ -736,10 +758,7 @@ async fn change_login_key(
 	};
 
 	// Check permissions
-	let scope = format!("users/{}/login_key/change", user_id);
-	if !user.has_scope(&scope) {
-		return Ok(HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)));
-	}
+	user.verify_scope(Scope::UsersLoginKeyChange(user_id))?;
 
 	let hashed_login_key = query.new_login_key.hash();
 	db.change_user_login_key(user_id, hashed_login_key).await?;
@@ -762,10 +781,7 @@ async fn user_info(db: Data<Arc<Database>>, path: web::Path<(String,)>, user: Au
 	};
 
 	// Check permissions
-	let scope = format!("users/{}/info", user_id);
-	if !user.has_scope(&scope) {
-		return Ok(HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)));
-	}
+	user.verify_scope(Scope::UsersInfo(user_id))?;
 
 	let lock = db.users.read().await;
 	let (username, user) = db
@@ -780,10 +796,44 @@ async fn user_info(db: Data<Arc<Database>>, path: web::Path<(String,)>, user: Au
 }
 
 
+/// List users
+#[actix_web::get("/users")]
+async fn list_users(db: Data<Arc<Database>>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	user.verify_scope(Scope::UsersList)?;
+
+	let users_lock = db.users.read().await;
+	let users = (0..users_lock.len())
+		.map(|id| {
+			let (username, user) = db.get_user_by_id(id.into(), &users_lock).unwrap();
+			json!({
+				"id": id,
+				"username": username,
+				"scopes": user.scopes.clone(),
+			})
+		})
+		.collect::<Vec<_>>();
+
+	Ok(HttpResponse::Ok().json(users))
+}
+
+
 /// List user's tokens
-#[actix_web::get("/users/me/tokens")]
-async fn list_user_tokens(db: Data<Arc<Database>>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
-	let tokens = db.list_user_tokens_by_user_id(user.id).await;
+#[actix_web::get("/users/{user}/tokens")]
+async fn list_user_tokens(db: Data<Arc<Database>>, user: AuthenticatedUser, path: web::Path<(String,)>) -> Result<HttpResponse, ServerError> {
+	// Parse user ID
+	let user_id = match path.into_inner().0.as_str() {
+		"me" => user.id,
+		s => match s.parse().map(UserId) {
+			Ok(id) => id,
+			Err(_) => return Ok(HttpResponse::BadRequest().body("Invalid user ID")),
+		},
+	};
+
+	// Check permissions
+	user.verify_scope(Scope::UsersTokensList(user_id))?;
+
+	let tokens = db.list_user_tokens_by_user_id(user_id).await;
 	Ok(HttpResponse::Ok().json(tokens))
 }
 
@@ -805,10 +855,7 @@ async fn change_user_scopes(
 	let new_scopes = query.0.new_scopes;
 
 	// Check permissions
-	let scope = format!("users/{}/scopes/change", target_user_id);
-	if !user.has_scope(&scope) {
-		return Ok(HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)));
-	}
+	user.verify_scope(Scope::UsersScopesChange(target_user_id))?;
 
 	match db.change_user_scopes(target_user_id, new_scopes).await {
 		Ok(()) => Ok(HttpResponse::Ok().finish()),
@@ -1100,9 +1147,7 @@ async fn upload_image(
 	user: AuthenticatedUser,
 ) -> Result<HttpResponse, ServerError> {
 	// Permissions
-	if !user.has_scope("images/upload") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/upload"));
-	}
+	user.verify_scope(Scope::ImagesUpload)?;
 
 	let mut files = form.files.into_iter();
 	let file = match files.next() {
@@ -1175,9 +1220,7 @@ async fn imgops_upload(
 	path: web::Path<(ImageIdentifier,)>,
 ) -> Result<HttpResponse, ServerError> {
 	// Check permissions
-	if !user.has_scope("images/imgops-upload") {
-		return Ok(HttpResponse::Forbidden().body("Insufficient permissions: images/imgops-upload"));
-	}
+	user.verify_scope(Scope::ImagesImgops)?;
 
 	// Get image
 	let (image,) = path.into_inner();
@@ -1280,7 +1323,7 @@ async fn create_user(
 	};
 
 	// Set scopes
-	let scopes = DEFAULT_USER_SCOPES.replace("{id}", &user_id.0.to_string());
+	let scopes = server_data.default_user_scopes.replace("{id}", &user_id.0.to_string());
 	db.change_user_scopes(user_id, scopes).await.context("Failed to set user scopes")?;
 
 	Ok(HttpResponse::Created().finish())
@@ -1512,4 +1555,29 @@ where
 {
 	let s: String = String::deserialize(deserializer)?;
 	hex::decode(&s).map_err(serde::de::Error::custom)
+}
+
+
+fn random_password() -> String {
+	const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+	                         abcdefghijklmnopqrstuvwxyz\
+	                         0123456789";
+	const PASSWORD_LEN: usize = 20;
+	let password = (0..PASSWORD_LEN)
+		.map(|_| {
+			let idx = CHARSET.choose(&mut OsRng).unwrap();
+			*idx as char
+		})
+		.collect();
+
+	password
+}
+
+
+fn login_key_from_password(username: &str, password: &str) -> LoginKey {
+	let mut login_key = LoginKey([0; 32]);
+	let scrypt_params = scrypt::Params::new(16, 8, 1, login_key.0.len()).expect("unexpected");
+	scrypt::scrypt(password.as_bytes(), username.as_bytes(), &scrypt_params, &mut login_key.0).expect("unexpected");
+
+	login_key
 }

@@ -183,11 +183,12 @@ impl<'a> ser::Serializer for &'a mut Serializer {
 	fn serialize_struct_variant(
 		self,
 		_name: &'static str,
-		_variant_index: u32,
+		variant_index: u32,
 		_variant: &'static str,
 		_len: usize,
 	) -> SerializerResult<Self::SerializeStructVariant> {
-		unimplemented!()
+		write_vli(&mut self.output, variant_index as u64).unwrap();
+		Ok(self)
 	}
 }
 
