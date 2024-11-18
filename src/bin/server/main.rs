@@ -55,51 +55,53 @@ const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 #[command()]
 struct Args {
 	/// IP address to bind to.
-	#[arg(long, default_value = "127.0.0.1")]
-	ip: String,
+	#[arg(env, long, default_value = "127.0.0.1")]
+	server_ip: String,
 
 	/// Port to bind to (default: 8086).
-	#[arg(long, default_value = "8186")]
-	port: u16,
+	#[arg(env, long, default_value = "8186")]
+	server_port: u16,
 
 	/// Path to the image directory.
-	#[arg(long, default_value = "images")]
+	#[arg(env, long, default_value = "images")]
 	image_dir: PathBuf,
 
 	/// Path to the upload directory.
-	#[arg(long, default_value = "upload")]
+	#[arg(env, long, default_value = "upload")]
 	upload_dir: PathBuf,
 
 	/// Path to the database directory.
-	#[arg(long, default_value = "db")]
+	#[arg(env, long, default_value = "db")]
 	db_dir: PathBuf,
 
 	/// Path to the server secrets file.
-	#[arg(long, default_value = "db/secrets.json")]
+	#[arg(env, long, default_value = "db/secrets.json")]
 	secrets_path: PathBuf,
 
 	// Can see their own user info, can change their own login key, can use imgops, can list their own user tokens, can invalidate their own user tokens
 	// Notably missing: can't create a user token for themselves, i.e. can't log in
 	/// Default user scopes.
 	#[arg(
+		env,
 		long,
 		default_value = "get/users/{id}, post/users/{id}/login_key, post/images/imgops, get/users/{id}/tokens, delete/users/{id}/tokens"
 	)]
 	default_user_scopes: String,
 
 	/// If the user table is empty, create a default admin user with the given username.
-	#[arg(long, default_value = "admin")]
+	#[arg(env, long, default_value = "admin")]
 	admin_user: String,
 
 	/// If the user table is empty, create a default admin user with the given scopes.
 	#[arg(
+		env,
 		long,
 		default_value = "post/users/*/scopes, get/users/*, */images/tags, */images/attributes, post/images/imgops, post/upload_image, post/users/*/tokens"
 	)]
 	admin_scopes: String,
 
 	/// Prediction server URL.
-	#[arg(long)]
+	#[arg(env, long)]
 	prediction_server: Url,
 }
 
@@ -134,10 +136,10 @@ async fn main() -> Result<(), anyhow::Error> {
 	let tag_mappings = tags::get_tag_mappings();
 
 	// Load database
-	let database = Arc::new(Database::open(&args.db_dir, true).await?);
+	let database = Arc::new(Database::open(&args.db_dir, true).await.context("Failed to open database")?);
 
 	// Load server secrets
-	let server_secrets = load_server_secrets(&args.secrets_path).await?;
+	let server_secrets = load_server_secrets(&args.secrets_path).await.context("Failed to load server secrets")?;
 
 	// Make sure default user scopes are valid
 	if parse_scopes(&args.default_user_scopes).is_err() {
@@ -168,10 +170,10 @@ async fn main() -> Result<(), anyhow::Error> {
 	};
 
 	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone()))
-		.bind((args.ip.as_str(), args.port))?
+		.bind((args.server_ip.as_str(), args.server_port))?
 		.run();
 
-	log::info!("Server running at http://{}:{}", args.ip, args.port);
+	log::info!("Server running at http://{}:{}", args.server_ip, args.server_port);
 
 	server.await?;
 

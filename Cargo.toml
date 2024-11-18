@@ -9,7 +9,7 @@ actix-files = "0.6"
 anyhow = "1"
 byteorder = "1.5"
 chrono = "0.4"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
 futures = "0.3"
 hex = "0.4"
@@ -43,3 +43,6 @@ hmac = "0.12.1"
 data-encoding = "2.6.0"
 thiserror = "2.0.3"
 scrypt = "0.11.0"
+
+[profile.release]
+debug = true
