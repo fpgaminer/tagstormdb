@@ -73,10 +73,8 @@ use std::{
 };
 
 use crate::{
-	database::ImageEntry,
-	default_progress_style,
-	errors::DatabaseError,
-	AttributeKeyId, AttributeValueId, ImageHash, ImageId, IndexMapTyped, StringId, TagId, UserId,
+	database::ImageEntry, default_progress_style, errors::DatabaseError, AttributeKeyId, AttributeValueId, ImageHash, ImageId, IndexMapTyped, StringId, TagId,
+	UserId,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use indicatif::{ProgressBar, ProgressDrawTarget};

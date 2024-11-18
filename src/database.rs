@@ -3,7 +3,12 @@
 use crate::{
 	binary_format::{
 		append_to_hash_table, append_to_log_file, append_to_strings_table, read_hash_table, read_log_file, read_string_table, LogActionWithData, LogEntry,
-	}, default_progress_style, errors::DatabaseError, small_db::{RowId, SmallDb}, AttributeIndex, AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, NumericAttributeIndex, StringId, TagId, TagIndex, UserId, UserToken
+	},
+	default_progress_style,
+	errors::DatabaseError,
+	small_db::{RowId, SmallDb},
+	AttributeIndex, AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, NumericAttributeIndex, StringId, TagId, TagIndex,
+	UserId, UserToken,
 };
 use chrono::Utc;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -78,8 +83,16 @@ impl UserEntry {
 
 #[derive(Deserialize, Serialize)]
 enum SmallDbEntry {
-	User { user_id: UserId, username: String, hashed_login_key: HashedLoginKey, scopes: String },
-	UserToken { user_id: UserId, token: UserToken },
+	User {
+		user_id: UserId,
+		username: String,
+		hashed_login_key: HashedLoginKey,
+		scopes: String,
+	},
+	UserToken {
+		user_id: UserId,
+		token: UserToken,
+	},
 }
 
 
@@ -327,7 +340,12 @@ impl Database {
 		//let _ = entry.insert(user_entry);
 
 		// Insert into the small db
-		let db_entry = SmallDbEntry::User { user_id, username: username, hashed_login_key, scopes: scopes.clone() };
+		let db_entry = SmallDbEntry::User {
+			user_id,
+			username,
+			hashed_login_key,
+			scopes: scopes.clone(),
+		};
 		let row_id = task::spawn_blocking(move || small_db_lock.insert_row(&db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
@@ -360,7 +378,12 @@ impl Database {
 
 		// Update the small db
 		let old_row_id = user.row_id;
-		let db_entry = SmallDbEntry::User { user_id, username: username.clone(), hashed_login_key: user.hashed_login_key, scopes: new_scopes };
+		let db_entry = SmallDbEntry::User {
+			user_id,
+			username: username.clone(),
+			hashed_login_key: user.hashed_login_key,
+			scopes: new_scopes,
+		};
 		let new_row_id = task::spawn_blocking(move || small_db_lock.update_row(old_row_id, &db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
@@ -388,7 +411,12 @@ impl Database {
 
 		// Update the small db
 		let old_row_id = user.row_id;
-		let db_entry = SmallDbEntry::User { user_id, username: username.clone(), hashed_login_key: new_hashed_login_key, scopes: user.scopes.clone() };
+		let db_entry = SmallDbEntry::User {
+			user_id,
+			username: username.clone(),
+			hashed_login_key: new_hashed_login_key,
+			scopes: user.scopes.clone(),
+		};
 		let new_row_id = task::spawn_blocking(move || small_db_lock.update_row(old_row_id, &db_entry))
 			.await
 			.expect("spawn_blocking failed")?;
@@ -1161,18 +1189,21 @@ pub enum StateUpdateResult<T> {
 
 
 fn read_small_db<P: AsRef<Path>>(path: P) -> Result<(IndexMapTyped<String, UserEntry, UserId>, HashMap<UserToken, (UserId, RowId)>, SmallDb), DatabaseError> {
-	let mut users = BTreeMap::new();   //: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
-	let mut user_tokens = HashMap::new();   //<UserToken, UserId>>,
+	let mut users = BTreeMap::new(); //: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
+	let mut user_tokens = HashMap::new(); //<UserToken, UserId>>,
 
-	let small_db = SmallDb::open(path.as_ref(), |row_id, row: SmallDbEntry| {
-		match row {
-			SmallDbEntry::User { user_id, username, hashed_login_key, scopes } => {
-				users.insert(user_id, (username, UserEntry::new(hashed_login_key, scopes, row_id)));
-			},
-			SmallDbEntry::UserToken { token, user_id } => {
-				user_tokens.insert(token, (user_id, row_id));
-			},
-		}
+	let small_db = SmallDb::open(path.as_ref(), |row_id, row: SmallDbEntry| match row {
+		SmallDbEntry::User {
+			user_id,
+			username,
+			hashed_login_key,
+			scopes,
+		} => {
+			users.insert(user_id, (username, UserEntry::new(hashed_login_key, scopes, row_id)));
+		},
+		SmallDbEntry::UserToken { token, user_id } => {
+			user_tokens.insert(token, (user_id, row_id));
+		},
 	})?;
 
 	// Build the index map

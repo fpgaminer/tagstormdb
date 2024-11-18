@@ -51,6 +51,10 @@ pub enum Scope {
 	ImagesImgops,
 	/// Can upload images
 	ImagesUpload,
+	/// Can run tag prediction on images
+	ImagesPredictTags,
+	/// Can run caption prediction on images
+	ImagesPredictCaption,
 	/// Can list user tokens
 	UsersTokensList(UserId),
 }
@@ -75,6 +79,8 @@ impl Scope {
 			Scope::UsersScopesChange(id) => format!("post/users/{}/scopes", id.0),
 			Scope::ImagesImgops => "post/images/imgops".to_string(),
 			Scope::ImagesUpload => "post/upload_image".to_string(),
+			Scope::ImagesPredictTags => "get/images/predict/tags".to_string(),
+			Scope::ImagesPredictCaption => "get/images/predict/caption".to_string(),
 		}
 	}
 }

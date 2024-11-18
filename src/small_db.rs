@@ -530,17 +530,23 @@ mod tests {
 			d: ComplicatedEnum,
 		}
 
-		let test_data = vec![Complicated {
-			a: 42,
-			b: "Hello, world!".to_string(),
-			c: vec![TestDataEnum::A(88), TestDataEnum::B("Hello, world!".to_string())],
-			d: ComplicatedEnum::C { a: 19, b: "Hello, world!".to_string() },
-		}, Complicated {
-			a: 3,
-			b: "Hello, doggy!".to_string(),
-			c: vec![TestDataEnum::B("How fancy".to_string())],
-			d: ComplicatedEnum::A((-42, 0xdeadbeef)),
-		}];
+		let test_data = vec![
+			Complicated {
+				a: 42,
+				b: "Hello, world!".to_string(),
+				c: vec![TestDataEnum::A(88), TestDataEnum::B("Hello, world!".to_string())],
+				d: ComplicatedEnum::C {
+					a: 19,
+					b: "Hello, world!".to_string(),
+				},
+			},
+			Complicated {
+				a: 3,
+				b: "Hello, doggy!".to_string(),
+				c: vec![TestDataEnum::B("How fancy".to_string())],
+				d: ComplicatedEnum::A((-42, 0xdeadbeef)),
+			},
+		];
 		let serialized = crate::small_db_serializer::to_bytes(&test_data).unwrap();
 		let deserialized: Vec<Complicated> = crate::small_db_deserializer::from_bytes(&serialized).unwrap();
 

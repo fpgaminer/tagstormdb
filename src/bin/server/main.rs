@@ -33,6 +33,7 @@ use flatbuffers_generated::tag_storm_db as flatbuffer_types;
 use hmac::{Hmac, Mac};
 use image::{imageops, ImageReader};
 use rand::{rngs::OsRng, seq::SliceRandom};
+use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use server_error::ServerError;
@@ -80,7 +81,10 @@ struct Args {
 	// Can see their own user info, can change their own login key, can use imgops, can list their own user tokens, can invalidate their own user tokens
 	// Notably missing: can't create a user token for themselves, i.e. can't log in
 	/// Default user scopes.
-	#[arg(long, default_value = "get/users/{id}, post/users/{id}/login_key, post/images/imgops, get/users/{id}/tokens, delete/users/{id}/tokens")]
+	#[arg(
+		long,
+		default_value = "get/users/{id}, post/users/{id}/login_key, post/images/imgops, get/users/{id}/tokens, delete/users/{id}/tokens"
+	)]
 	default_user_scopes: String,
 
 	/// If the user table is empty, create a default admin user with the given username.
@@ -88,8 +92,15 @@ struct Args {
 	admin_user: String,
 
 	/// If the user table is empty, create a default admin user with the given scopes.
-	#[arg(long, default_value = "post/users/*/scopes, get/users/*, */images/tags, */images/attributes, post/images/imgops, post/upload_image, post/users/*/tokens")]
+	#[arg(
+		long,
+		default_value = "post/users/*/scopes, get/users/*, */images/tags, */images/attributes, post/images/imgops, post/upload_image, post/users/*/tokens"
+	)]
 	admin_scopes: String,
+
+	/// Prediction server URL.
+	#[arg(long)]
+	prediction_server: Url,
 }
 
 
@@ -99,6 +110,7 @@ struct ServerData {
 	upload_dir: PathBuf,
 	server_secrets: ServerSecrets,
 	default_user_scopes: String,
+	prediction_server: Url,
 }
 
 #[derive(Deserialize, Clone)]
@@ -152,6 +164,7 @@ async fn main() -> Result<(), anyhow::Error> {
 		upload_dir: args.upload_dir,
 		server_secrets,
 		default_user_scopes: args.default_user_scopes,
+		prediction_server: args.prediction_server,
 	};
 
 	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone()))
@@ -225,6 +238,8 @@ fn build_app(
 		.service(create_user)
 		.service(get_cf_turnstile_key)
 		.service(list_users)
+		.service(predict_tags)
+		.service(predict_caption)
 }
 
 
@@ -1406,6 +1421,138 @@ async fn get_cf_turnstile_key(server_data: Data<ServerData>) -> HttpResponse {
 		Some(key) => HttpResponse::Ok().body(key.clone()),
 		None => HttpResponse::NotFound().finish(),
 	}
+}
+
+
+async fn get_image_data_by_identifier<'a>(db: &'a Database, image: ImageIdentifier, server_data: &'a ServerData) -> Option<Vec<u8>> {
+	let images_lock = db.images.read().await;
+	let image = match image {
+		ImageIdentifier::Hash(hash) => db.get_image_by_hash(&hash, &images_lock).await,
+		ImageIdentifier::Id(id) => db.get_image_by_id(id, &images_lock).await,
+	};
+	let image = match image {
+		Some(image) => image,
+		None => return None,
+	};
+
+	// Check if image is active and exists
+	let hash_str = hex::encode(image.hash.0);
+	let image_path = server_data.image_dir.join(&hash_str[0..2]).join(&hash_str[2..4]).join(&hash_str);
+
+	if !image.active || !image_path.exists() {
+		return None;
+	}
+
+	// Read file
+	let file_bytes = match tokio::fs::read(&image_path).await {
+		Ok(bytes) => bytes,
+		Err(err) => {
+			log::error!("Failed to read image file {}: {:?}", image_path.display(), err);
+			return None;
+		},
+	};
+
+	Some(file_bytes)
+}
+
+
+#[derive(Deserialize)]
+struct PredictTagsQuery {
+	tags: Option<String>,
+}
+
+/// Predict tags for an image
+/// Forwards to the prediction server
+#[actix_web::get("/images/{image}/predict/tags")]
+async fn predict_tags(
+	db: Data<Arc<Database>>,
+	user: AuthenticatedUser,
+	path: web::Path<(ImageIdentifier,)>,
+	server_data: Data<ServerData>,
+	query: web::Query<PredictTagsQuery>,
+) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	user.verify_scope(Scope::ImagesPredictTags)?;
+
+	// Parse tags as a comma-separated list
+	let tags = query.tags.as_ref().map(|s| s.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>());
+
+	// Get image
+	let (image,) = path.into_inner();
+	let image_data = match get_image_data_by_identifier(&db, image, &server_data).await {
+		Some(data) => data,
+		None => return Ok(HttpResponse::NotFound().body("Image not found")),
+	};
+
+	// Build request to prediction server
+	let file_part = reqwest::multipart::Part::bytes(image_data).file_name("file");
+	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+	let mut form = reqwest::multipart::Form::new().part("image", file_part);
+
+	let url = if let Some(tags) = tags {
+		for tag in tags {
+			form = form.text("tags", tag);
+		}
+
+		server_data.prediction_server.join("tag_assoc").context("Failed to build URL")?
+	} else {
+		server_data.prediction_server.join("predict").context("Failed to build URL")?
+	};
+
+	// Forward to the prediction server
+	let response = client.post(url).multipart(form).send().await?;
+
+	if !response.status().is_success() {
+		return Ok(HttpResponse::InternalServerError().body("Prediction server failed"));
+	}
+
+	let body = response.bytes().await?.to_vec();
+
+	Ok(HttpResponse::Ok().content_type("application/json").body(body))
+}
+
+
+#[derive(Deserialize)]
+struct PredictCaptionQuery {
+	prompt: String,
+}
+
+/// Predict caption for an image
+/// Forwards to the prediction server
+#[actix_web::get("/images/{image}/predict/caption")]
+async fn predict_caption(
+	db: Data<Arc<Database>>,
+	user: AuthenticatedUser,
+	query: web::Query<PredictCaptionQuery>,
+	path: web::Path<(ImageIdentifier,)>,
+	server_data: Data<ServerData>,
+) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	user.verify_scope(Scope::ImagesPredictCaption)?;
+
+	// Get image
+	let (image,) = path.into_inner();
+	let image_data = match get_image_data_by_identifier(&db, image, &server_data).await {
+		Some(data) => data,
+		None => return Ok(HttpResponse::NotFound().body("Image not found")),
+	};
+
+	// Build request to prediction server
+	let file_part = reqwest::multipart::Part::bytes(image_data).file_name("file");
+	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+	let form = reqwest::multipart::Form::new().part("image", file_part).text("prompt", query.prompt.clone());
+
+	// Forward to the prediction server
+	let url = server_data.prediction_server.join("caption").context("Failed to build URL")?;
+	let response = client.post(url).multipart(form).send().await?;
+
+	if !response.status().is_success() {
+		return Ok(HttpResponse::InternalServerError().body("Prediction server failed"));
+	}
+
+	let body = response.bytes().await?.to_vec();
+
+	Ok(HttpResponse::Ok().content_type("application/json").body(body))
 }
 
 
