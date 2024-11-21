@@ -28,9 +28,9 @@ mod newtype_macros;
 pub mod binary_format;
 pub mod database;
 pub mod small_db;
-mod small_db_deserializer;
+pub mod small_db_deserializer;
 mod small_db_errors;
-mod small_db_serializer;
+pub mod small_db_serializer;
 
 pub use database::Database;
 
@@ -178,10 +178,10 @@ impl<'de> Deserialize<'de> for UserToken {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let s = String::deserialize(deserializer)?;
-		let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-		let hash = bytes.try_into().map_err(|_| serde::de::Error::custom("Invalid token length"))?;
-		Ok(UserToken(hash))
+		let bytes = Vec::<u8>::deserialize(deserializer)?;
+		Ok(UserToken(
+			bytes.as_slice().try_into().map_err(|_| serde::de::Error::custom("Invalid token length"))?,
+		))
 	}
 }
 
@@ -190,7 +190,7 @@ impl Serialize for UserToken {
 	where
 		S: serde::Serializer,
 	{
-		serializer.serialize_str(&hex::encode(self.0))
+		serializer.serialize_bytes(&self.0)
 	}
 }
 
@@ -201,6 +201,7 @@ define_id_type!(ImageId);
 define_id_type!(StringId);
 define_id_type!(AttributeKeyId, convert StringId);
 define_id_type!(AttributeValueId, convert StringId);
+define_id_type!(TaskId);
 
 
 /// Wraps IndexMap to enforce that the index is of type I

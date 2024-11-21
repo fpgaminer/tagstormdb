@@ -57,6 +57,15 @@ pub enum Scope {
 	ImagesPredictCaption,
 	/// Can list user tokens
 	UsersTokensList(UserId),
+
+	/// Can add tasks to the task queue
+	TaskQueueInsert,
+	/// Can view tasks in the task queue
+	TaskQueueView,
+	/// Can remove tasks from the task queue
+	TaskQueueDelete,
+	/// Can acquire and finish tasks from the task queue
+	TaskQueueAcquire,
 }
 
 impl Scope {
@@ -81,6 +90,11 @@ impl Scope {
 			Scope::ImagesUpload => "post/upload_image".to_string(),
 			Scope::ImagesPredictTags => "get/images/predict/tags".to_string(),
 			Scope::ImagesPredictCaption => "get/images/predict/caption".to_string(),
+
+			Scope::TaskQueueInsert => "post/task-queue".to_string(),
+			Scope::TaskQueueView => "get/task-queue".to_string(),
+			Scope::TaskQueueDelete => "delete/task-queue".to_string(),
+			Scope::TaskQueueAcquire => "post/task-queue/acquire".to_string(),
 		}
 	}
 }

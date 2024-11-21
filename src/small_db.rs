@@ -31,7 +31,7 @@ use crate::{small_db_deserializer::from_bytes, small_db_serializer::to_bytes};
 pub use crate::small_db_errors::DbError;
 
 
-pub struct SmallDb {
+pub struct SmallDb<T> {
 	/// Map of inactive records, indexed by their length
 	inactive_map: BTreeMap<u32, Vec<u64>>,
 
@@ -43,6 +43,8 @@ pub struct SmallDb {
 
 	#[doc(hidden)]
 	_internal_use_danger_do_not_use_wal_failure_test: bool,
+
+	phantom: std::marker::PhantomData<T>,
 }
 
 
@@ -164,7 +166,17 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 		}
 
 		// Deserialize the record
-		let record: T = from_bytes(&buffer[..len as usize - 2])?;
+		let record: T = match from_bytes(&buffer[..len as usize - 2]) {
+			Ok(record) => record,
+			Err(err) => {
+				println!("Error deserializing record at position {}: {:?}", start_position, err);
+				for b in &buffer {
+					print!("{:02x}", b);
+				}
+				println!();
+				return Err(DbError::from(err));
+			},
+		};
 		callback(RowId(start_position), record);
 	}
 
@@ -172,8 +184,8 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 }
 
 
-impl SmallDb {
-	pub fn open<T: DeserializeOwned>(path: &Path, callback: impl FnMut(RowId, T)) -> Result<SmallDb, DbError> {
+impl<T: DeserializeOwned + Serialize> SmallDb<T> {
+	pub fn open(path: &Path, callback: impl FnMut(RowId, T)) -> Result<SmallDb<T>, DbError> {
 		let parent_dir = path.parent().ok_or_else(|| {
 			DbError::IoError(
 				std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"),
@@ -184,7 +196,7 @@ impl SmallDb {
 		// TODO: Exclusively lock the file
 
 		// Replay the WAL
-		SmallDb::play_wal(&mut file, parent_dir)?;
+		SmallDb::<T>::play_wal(&mut file, parent_dir)?;
 
 		// Read the database
 		Ok(SmallDb {
@@ -192,6 +204,7 @@ impl SmallDb {
 			file,
 			parent_dir: parent_dir.to_path_buf(),
 			_internal_use_danger_do_not_use_wal_failure_test: false,
+			phantom: std::marker::PhantomData,
 		})
 	}
 
@@ -286,7 +299,7 @@ impl SmallDb {
 		(self.file.seek(SeekFrom::End(0)).unwrap(), len)
 	}
 
-	pub fn insert_row<T: Serialize>(&mut self, record: &T) -> Result<RowId, DbError> {
+	pub fn insert_row(&mut self, record: &T) -> Result<RowId, DbError> {
 		let wal_path = self.parent_dir.join("wal");
 
 		// Serialize the record
@@ -362,7 +375,7 @@ impl SmallDb {
 	}
 
 	/// Update a row in the database
-	pub fn update_row<T: Serialize>(&mut self, position: RowId, record: &T) -> Result<RowId, DbError> {
+	pub fn update_row(&mut self, position: RowId, record: &T) -> Result<RowId, DbError> {
 		let wal_path = self.parent_dir.join("wal");
 
 		// Serialize the new record
