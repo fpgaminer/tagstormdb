@@ -8,7 +8,7 @@ use crate::{
 	errors::DatabaseError,
 	small_db::{RowId, SmallDb},
 	AttributeIndex, AttributeKeyId, AttributeValueId, HashedLoginKey, ImageHash, ImageId, IndexMapTyped, NumericAttributeIndex, StringId, TagId, TagIndex,
-	UserId, UserToken,
+	TaskId, UserId, UserToken,
 };
 use chrono::Utc;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -23,7 +23,7 @@ use std::{
 	sync::Arc,
 };
 use tokio::{
-	sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
+	sync::{Mutex, OwnedMutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard},
 	task,
 };
 
@@ -81,8 +81,37 @@ impl UserEntry {
 	}
 }
 
-#[derive(Deserialize, Serialize)]
-enum SmallDbEntry {
+
+#[derive(Deserialize, Serialize, Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+	/// The task is waiting to be picked up
+	Waiting,
+	/// The task is being worked on
+	InProgress,
+	/// The task is done
+	Done,
+}
+
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct TaskEntry {
+	pub id: TaskId,
+	/// Task group
+	pub group: StringId,
+	/// JSON data for this task
+	pub data: String,
+	/// Task status
+	pub status: TaskStatus,
+	/// Time the task's status was last modified (created, acquired, completed)
+	pub modified_time: i64,
+	/// The last user to affect the status of this task
+	pub blame: UserId,
+}
+
+
+#[derive(Deserialize, Serialize, Debug)]
+pub enum SmallDbEntry {
 	User {
 		user_id: UserId,
 		username: String,
@@ -93,6 +122,7 @@ enum SmallDbEntry {
 		user_id: UserId,
 		token: UserToken,
 	},
+	Task(TaskEntry),
 }
 
 
@@ -104,6 +134,9 @@ type StringTableRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<String, Option<
 type StringTableReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type IndexByAttributeNumericRwGuard<'a> = RwLockWriteGuard<'a, NumericAttributeIndex>;
 type UsersReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, UserEntry, UserId>>;
+type TaskQueueReadLock<'a> = RwLockReadGuard<'a, HashMap<TaskId, (TaskEntry, RowId)>>;
+type TaskQueueWriteLock<'a> = RwLockWriteGuard<'a, HashMap<TaskId, (TaskEntry, RowId)>>;
+type SmallDbGuard = OwnedMutexGuard<SmallDb<SmallDbEntry>>;
 
 
 pub struct Database {
@@ -112,6 +145,7 @@ pub struct Database {
 	pub string_table: Arc<RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>>,
 	pub users: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
 	pub user_tokens: RwLock<HashMap<UserToken, (UserId, RowId)>>,
+	pub task_queue: Arc<RwLock<HashMap<TaskId, (TaskEntry, RowId)>>>,
 
 	/// tag id -> images with that tag
 	pub index_by_tag: RwLock<TagIndex>,
@@ -124,7 +158,7 @@ pub struct Database {
 	logs_file: Arc<Mutex<std::fs::File>>,
 	hashes_file: Arc<Mutex<std::fs::File>>,
 	strings_file: Arc<Mutex<std::fs::File>>,
-	small_db: Arc<Mutex<SmallDb>>,
+	small_db: Arc<Mutex<SmallDb<SmallDbEntry>>>,
 }
 
 impl Database {
@@ -166,10 +200,11 @@ impl Database {
 
 			// Read smalldb tables
 			let start_time = std::time::Instant::now();
-			let (users, user_tokens, small_db) = read_small_db(path.join("small_db.bin"))?;
+			let (users, user_tokens, task_queue, small_db) = read_small_db(path.join("small_db.bin"))?;
 			log::info!("Read small db tables in {:?}", start_time.elapsed());
 			log::info!("Users: {}", users.len());
 			log::info!("User tokens: {}", user_tokens.len());
+			log::info!("Task queue: {}", task_queue.len());
 
 			// Create the database object
 			let database = Self {
@@ -178,6 +213,7 @@ impl Database {
 				tags: RwLock::new(IndexMapTyped::new()),
 				users: Arc::new(RwLock::new(users)),
 				user_tokens: RwLock::new(user_tokens),
+				task_queue: Arc::new(RwLock::new(task_queue)),
 				index_by_tag: RwLock::new(TagIndex::new()),
 				index_by_attribute: RwLock::new(AttributeIndex::new()),
 				index_by_attribute_numeric: RwLock::new(NumericAttributeIndex::new()),
@@ -337,7 +373,6 @@ impl Database {
 			indexmap::map::Entry::Vacant(entry) => entry,
 		};
 		let user_id: UserId = entry.index().into();
-		//let _ = entry.insert(user_entry);
 
 		// Insert into the small db
 		let db_entry = SmallDbEntry::User {
@@ -890,6 +925,69 @@ impl Database {
 		StateUpdateResult::Updated(())
 	}
 
+	/// Internal method for adding a new task to the task queue
+	async fn state_add_task(&self, task: TaskEntry, mut task_queue: TaskQueueWriteLock<'_>, mut small_db: SmallDbGuard) -> Result<(), DatabaseError> {
+		// Make sure ID isn't already used
+		if task_queue.contains_key(&task.id) {
+			return Err(DatabaseError::TaskIdAlreadyExists);
+		}
+
+		// Find the next task id
+		//let max_task_id = task_queue.keys().max().copied().unwrap_or(TaskId(0));
+		//let task_id = max_task_id.0.checked_add(1).map(TaskId).ok_or(DatabaseError::TableIdOverflow)?;
+
+		// Insert into small db
+		let task_id = task.id;
+		let task_clone = SmallDbEntry::Task(task.clone());
+		let row_id = task::spawn_blocking(move || small_db.insert_row(&task_clone))
+			.await
+			.expect("spawn_blocking failed")?;
+
+		// Update the state
+		task_queue.insert(task_id, (task, row_id));
+
+		Ok(())
+	}
+
+	/// Internal method for removing a task from the task queue
+	async fn state_remove_task(&self, task_id: TaskId) -> Result<(), DatabaseError> {
+		let mut task_queue = self.task_queue.write().await;
+		let mut small_db = self.small_db.clone().lock_owned().await;
+
+		// Remove from the state and get the row id
+		let row_id = match task_queue.remove(&task_id) {
+			Some((_, row_id)) => row_id,
+			None => return Err(DatabaseError::TaskDoesNotExist),
+		};
+
+		// Remove from the small db
+		task::spawn_blocking(move || small_db.delete_row(row_id))
+			.await
+			.expect("spawn_blocking failed")?;
+
+		Ok(())
+	}
+
+	/// Internal method for updating a task
+	async fn state_update_task(&self, task: TaskEntry, mut task_queue: TaskQueueWriteLock<'_>, mut small_db: SmallDbGuard) -> Result<(), DatabaseError> {
+		// Get the row id
+		let row_id = match task_queue.get(&task.id) {
+			Some(&(_, row_id)) => row_id,
+			None => return Err(DatabaseError::TaskDoesNotExist),
+		};
+
+		// Update the small db
+		let task_clone = SmallDbEntry::Task(task.clone());
+		let new_row_id = task::spawn_blocking(move || small_db.update_row(row_id, &task_clone))
+			.await
+			.expect("spawn_blocking failed")?;
+
+		// Update the state
+		task_queue.insert(task.id, (task, new_row_id));
+
+		Ok(())
+	}
+
 
 	// ========================
 	// Public Actions
@@ -1175,6 +1273,86 @@ impl Database {
 
 		Ok(StateUpdateResult::Updated(()))
 	}
+
+	/// Add a new task to the task queue.
+	/// Possible side effects:
+	/// - self.task_queue
+	/// - self.small_db
+	/// - self.strings_file
+	pub async fn add_task(&self, task_group: String, task_data: String, task_status: TaskStatus, user_id: UserId) -> Result<(), DatabaseError> {
+		// Get string IDs
+		let task_group = self.get_or_insert_string_id(task_group).await?;
+
+		// Grab locks
+		let task_queue = self.task_queue.write().await;
+		let small_db = self.small_db.clone().lock_owned().await;
+
+		// Find the next task id
+		let task_id = {
+			let max_task_id = task_queue.keys().max().copied().unwrap_or(TaskId(0));
+			max_task_id.0.checked_add(1).map(TaskId).ok_or(DatabaseError::TableIdOverflow)?
+		};
+
+		let task = TaskEntry {
+			id: task_id,
+			group: task_group,
+			data: task_data,
+			status: task_status,
+			modified_time: Utc::now().timestamp_millis(),
+			blame: user_id,
+		};
+
+		self.state_add_task(task, task_queue, small_db).await?;
+
+		Ok(())
+	}
+
+	/// Remove a task from the task queue.
+	/// Possible side effects:
+	/// - self.task_queue
+	/// - self.small_db
+	pub async fn remove_task(&self, task_id: TaskId) -> Result<(), DatabaseError> {
+		self.state_remove_task(task_id).await
+	}
+
+	/// Update a task in the task queue.
+	/// Possible side effects:
+	/// - self.task_queue
+	/// - self.small_db
+	pub async fn update_task(
+		&self,
+		task_id: TaskId,
+		data: Option<String>,
+		status: Option<TaskStatus>,
+		modified_time: Option<i64>,
+		blame: Option<UserId>,
+		task_queue: TaskQueueWriteLock<'_>,
+	) -> Result<(), DatabaseError> {
+		let small_db = self.small_db.clone().lock_owned().await;
+
+		// Get the existing task
+		let mut task = match task_queue.get(&task_id) {
+			Some((task, _)) => task.clone(),
+			None => return Err(DatabaseError::TaskDoesNotExist),
+		};
+
+		// Make requested changes
+		if let Some(data) = data {
+			task.data = data;
+		}
+		if let Some(status) = status {
+			task.status = status;
+		}
+		if let Some(modified_time) = modified_time {
+			task.modified_time = modified_time;
+		}
+		if let Some(blame) = blame {
+			task.blame = blame;
+		}
+
+		// Update the task
+		self.state_update_task(task, task_queue, small_db).await
+	}
 }
 
 
@@ -1188,9 +1366,20 @@ pub enum StateUpdateResult<T> {
 }
 
 
-fn read_small_db<P: AsRef<Path>>(path: P) -> Result<(IndexMapTyped<String, UserEntry, UserId>, HashMap<UserToken, (UserId, RowId)>, SmallDb), DatabaseError> {
-	let mut users = BTreeMap::new(); //: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
-	let mut user_tokens = HashMap::new(); //<UserToken, UserId>>,
+fn read_small_db<P: AsRef<Path>>(
+	path: P,
+) -> Result<
+	(
+		IndexMapTyped<String, UserEntry, UserId>,
+		HashMap<UserToken, (UserId, RowId)>,
+		HashMap<TaskId, (TaskEntry, RowId)>,
+		SmallDb<SmallDbEntry>,
+	),
+	DatabaseError,
+> {
+	let mut users = BTreeMap::new();
+	let mut user_tokens = HashMap::new();
+	let mut task_queue = HashMap::new();
 
 	let small_db = SmallDb::open(path.as_ref(), |row_id, row: SmallDbEntry| match row {
 		SmallDbEntry::User {
@@ -1203,6 +1392,9 @@ fn read_small_db<P: AsRef<Path>>(path: P) -> Result<(IndexMapTyped<String, UserE
 		},
 		SmallDbEntry::UserToken { token, user_id } => {
 			user_tokens.insert(token, (user_id, row_id));
+		},
+		SmallDbEntry::Task(task) => {
+			task_queue.insert(task.id, (task, row_id));
 		},
 	})?;
 
@@ -1219,5 +1411,5 @@ fn read_small_db<P: AsRef<Path>>(path: P) -> Result<(IndexMapTyped<String, UserE
 		users_indexmap.insert(username, user_entry);
 	}
 
-	Ok((users_indexmap, user_tokens, small_db))
+	Ok((users_indexmap, user_tokens, task_queue, small_db))
 }

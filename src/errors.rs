@@ -11,6 +11,9 @@ pub enum DatabaseError {
 	UserAlreadyExists,
 	UserDoesNotExist,
 	SmallDbError(small_db::DbError),
+	TableIdOverflow,
+	TaskIdAlreadyExists,
+	TaskDoesNotExist,
 }
 
 impl From<std::io::Error> for DatabaseError {
@@ -43,6 +46,9 @@ impl std::fmt::Display for DatabaseError {
 			Self::UserAlreadyExists => write!(f, "User already exists"),
 			Self::UserDoesNotExist => write!(f, "User does not exist"),
 			Self::SmallDbError(e) => write!(f, "SmallDbError: {}", e),
+			Self::TableIdOverflow => write!(f, "Table ID overflow"),
+			Self::TaskIdAlreadyExists => write!(f, "Task ID already exists"),
+			Self::TaskDoesNotExist => write!(f, "Task does not exist"),
 		}
 	}
 }

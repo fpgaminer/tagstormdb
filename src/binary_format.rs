@@ -283,7 +283,7 @@ pub(crate) fn write_vli<W: Write>(mut writer: W, n: u64) -> Result<(), std::io::
 
 
 /// Read a variable-length integer from a reader
-pub(crate) fn read_vli<R: Read>(mut reader: R) -> Result<u64, std::io::Error> {
+pub fn read_vli<R: Read>(mut reader: R) -> Result<u64, std::io::Error> {
 	let byte = reader.read_u8()?;
 
 	Ok(match byte {

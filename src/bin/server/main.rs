@@ -1,9 +1,11 @@
 mod auth;
+mod crypto;
 #[allow(dead_code, unused_imports)]
 #[path = "flatbuffers_generated.rs"]
 mod flatbuffers_generated;
 mod server_error;
 mod tags;
+mod task_queue;
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -26,18 +28,17 @@ use actix_web::{
 use anyhow::Context;
 use auth::{AuthenticatedUser, Scope};
 use clap::Parser;
+use crypto::{authenticate_data, derive_key, login_key_from_password, random_password};
 use data_encoding::BASE32;
 use env_logger::Env;
 use flatbuffers::{FlatBufferBuilder, WIPOffset};
 use flatbuffers_generated::tag_storm_db as flatbuffer_types;
-use hmac::{Hmac, Mac};
 use image::{imageops, ImageReader};
-use rand::{rngs::OsRng, seq::SliceRandom};
 use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use server_error::ServerError;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use tags::TagMappings;
 use tagstormdb::{
 	database::{parse_scopes, ImageEntry, ImagesReadGuard, ImagesRwLock, StateUpdateResult, StringTableRwLock},
@@ -45,10 +46,12 @@ use tagstormdb::{
 	search::TreeSort,
 	AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId, UserId, UserToken,
 };
+use task_queue::{task_queue_acquire, task_queue_delete, task_queue_finish, task_queue_insert, task_queue_view};
 use tokio::io::AsyncReadExt;
 
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+const TASK_EXPIRATION_TIME: i64 = 10 * 60; // 10 minutes
 
 
 #[derive(Parser, Debug)]
@@ -242,6 +245,11 @@ fn build_app(
 		.service(list_users)
 		.service(predict_tags)
 		.service(predict_caption)
+		.service(task_queue_insert)
+		.service(task_queue_delete)
+		.service(task_queue_view)
+		.service(task_queue_acquire)
+		.service(task_queue_finish)
 }
 
 
@@ -1062,78 +1070,81 @@ fn build_search_response(
 
 		// Full objects in all other cases
 		_ => {
-			builder.start_vector::<WIPOffset<flatbuffer_types::Image>>(n_results);
-			sorted.with_images(&images_lock).for_each(|(_id, hash, image)| {
-				// Image hash
-				let hash = if select.contains(&SearchSelect::Hash) {
-					Some(flatbuffer_types::Hash(hash.0))
-				} else {
-					None
-				};
+			let images: Vec<_> = sorted
+				.with_images(&images_lock)
+				.map(|(_id, hash, image)| {
+					// Image hash
+					let hash = if select.contains(&SearchSelect::Hash) {
+						Some(flatbuffer_types::Hash(hash.0))
+					} else {
+						None
+					};
 
-				// Image tags
-				let tags = if select.contains(&SearchSelect::Tags) {
-					builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
-					image.tags.iter().for_each(|(tag_id, user_id)| {
-						let tag_with_blame = flatbuffer_types::TagWithBlame::create(
-							&mut builder,
-							&flatbuffer_types::TagWithBlameArgs {
-								tag: tag_id.0 as u32,
-								blame: user_id.0 as u32,
-							},
-						);
-
-						builder.push(&tag_with_blame);
-					});
-					Some(builder.end_vector(image.tags.len()))
-				} else {
-					None
-				};
-
-				// Image attributes
-				let attributes = if select.contains(&SearchSelect::Attributes) {
-					let strings_lock = strings_lock.blocking_read();
-
-					builder.start_vector::<WIPOffset<flatbuffer_types::AttributeWithBlame>>(image.attributes.len());
-
-					image.attributes.iter().for_each(|(key_id, values)| {
-						let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
-						let key_offset = builder.create_string(key_str);
-
-						values.iter().for_each(|(value_id, user_id)| {
-							let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
-							let value_offset = builder.create_string(value_str);
-							let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
+					// Image tags
+					let tags = if select.contains(&SearchSelect::Tags) {
+						builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
+						image.tags.iter().for_each(|(tag_id, user_id)| {
+							let tag_with_blame = flatbuffer_types::TagWithBlame::create(
 								&mut builder,
-								&flatbuffer_types::AttributeWithBlameArgs {
-									key: Some(key_offset),
-									value: Some(value_offset),
+								&flatbuffer_types::TagWithBlameArgs {
+									tag: tag_id.0 as u32,
 									blame: user_id.0 as u32,
 								},
 							);
 
-							builder.push(&attribute_with_blame);
+							builder.push(&tag_with_blame);
 						});
-					});
-					Some(builder.end_vector(image.attributes.len()))
-				} else {
-					None
-				};
+						Some(builder.end_vector(image.tags.len()))
+					} else {
+						None
+					};
 
-				let image = flatbuffers_generated::tag_storm_db::Image::create(
-					&mut builder,
-					&flatbuffers_generated::tag_storm_db::ImageArgs {
-						id: image.id.0 as u32,
-						hash: hash.as_ref(),
-						tags,
-						attributes,
-					},
-				);
+					// Image attributes
+					let attributes = if select.contains(&SearchSelect::Attributes) {
+						let strings_lock = strings_lock.blocking_read();
+						let mut attributes = Vec::new();
 
-				builder.push(&image);
-			});
+						image.attributes.iter().for_each(|(key_id, values)| {
+							let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
+							let key_offset = builder.create_string(key_str);
 
-			let images_vector = builder.end_vector(n_results);
+							values.iter().for_each(|(value_id, user_id)| {
+								let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
+								let value_offset = builder.create_string(value_str);
+								let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
+									&mut builder,
+									&flatbuffer_types::AttributeWithBlameArgs {
+										key: Some(key_offset),
+										value: Some(value_offset),
+										blame: user_id.0 as u32,
+									},
+								);
+
+								attributes.push(attribute_with_blame);
+							});
+						});
+
+						Some(builder.create_vector(&attributes))
+					} else {
+						None
+					};
+
+					let image = flatbuffers_generated::tag_storm_db::Image::create(
+						&mut builder,
+						&flatbuffers_generated::tag_storm_db::ImageArgs {
+							id: image.id.0 as u32,
+							hash: hash.as_ref(),
+							tags,
+							attributes,
+						},
+					);
+
+					image
+				})
+				.collect();
+
+			let images_vector = builder.create_vector(&images);
+
 			let image_response = flatbuffer_types::ImageResponse::create(&mut builder, &flatbuffer_types::ImageResponseArgs { images: Some(images_vector) });
 			let search_response = flatbuffer_types::SearchResultResponse::create(
 				&mut builder,
@@ -1502,11 +1513,17 @@ async fn predict_tags(
 	};
 
 	// Forward to the prediction server
-	let response = client.post(url).multipart(form).send().await?;
-
-	if !response.status().is_success() {
-		return Ok(HttpResponse::InternalServerError().body("Prediction server failed"));
-	}
+	let response = match client.post(url).multipart(form).send().await {
+		Ok(response) if response.status().is_success() => response,
+		Ok(response) => {
+			log::warn!("Prediction server failed: {}", response.status());
+			return Ok(HttpResponse::BadGateway().body("Prediction server may be offline"));
+		},
+		Err(err) => {
+			log::warn!("Prediction server failed: {:?}", err);
+			return Ok(HttpResponse::BadGateway().body("Prediction server may be offline"));
+		},
+	};
 
 	let body = response.bytes().await?.to_vec();
 
@@ -1645,88 +1662,10 @@ async fn hash_async_reader<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Re
 }
 
 
-/// Authenticate data using an HMAC-SHA512 construct
-/// The data is expected to be a byte array with a 32-byte hmac at the end
-/// AAD is additional authenticated data, which can be used to make the authentication context more specific
-///
-/// Returns the authenticated data if the authentication was successful
-/// Otherwise returns None
-fn authenticate_data<'a>(aad: &[u8], data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
-	assert!(key.len() >= 32);
-
-	// We expect data to be arbitrary data with a 32-byte hmac at the end
-	if data.len() < 32 {
-		return None;
-	}
-
-	let (data, stored_hmac) = data.split_at(data.len() - 32);
-	assert_eq!(stored_hmac.len(), 32);
-
-	// Compute the hmac
-	let mut hmac = Hmac::<Sha512>::new_from_slice(key).expect("unexpected");
-	hmac.update(aad);
-	hmac.update(data);
-	hmac.update(&u64::try_from(aad.len()).expect("length did not fit into u64").to_le_bytes());
-	hmac.update(&u64::try_from(data.len()).expect("length did not fit into u64").to_le_bytes());
-
-	// Truncate to 256 bits
-	let computed_hmac = hmac.finalize().into_bytes();
-	assert_eq!(computed_hmac.len(), 64);
-	let computed_hmac = &computed_hmac[0..32];
-
-	// Constant time compare
-	use ::subtle::ConstantTimeEq;
-
-	if computed_hmac.ct_eq(stored_hmac).into() {
-		Some(data)
-	} else {
-		None
-	}
-}
-
-
-/// Derive a key from a master key
-fn derive_key(master_key: &[u8], purpose: &[u8]) -> [u8; 64] {
-	assert!(master_key.len() >= 32);
-	assert!(!purpose.is_empty());
-
-	let mut hmac = Hmac::<Sha512>::new_from_slice(master_key).expect("unexpected");
-	hmac.update(purpose);
-	let key = hmac.finalize().into_bytes();
-
-	key.into()
-}
-
-
 fn deserialize_hex<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
 	D: Deserializer<'de>,
 {
 	let s: String = String::deserialize(deserializer)?;
 	hex::decode(&s).map_err(serde::de::Error::custom)
-}
-
-
-fn random_password() -> String {
-	const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-	                         abcdefghijklmnopqrstuvwxyz\
-	                         0123456789";
-	const PASSWORD_LEN: usize = 20;
-	let password = (0..PASSWORD_LEN)
-		.map(|_| {
-			let idx = CHARSET.choose(&mut OsRng).unwrap();
-			*idx as char
-		})
-		.collect();
-
-	password
-}
-
-
-fn login_key_from_password(username: &str, password: &str) -> LoginKey {
-	let mut login_key = LoginKey([0; 32]);
-	let scrypt_params = scrypt::Params::new(16, 8, 1, login_key.0.len()).expect("unexpected");
-	scrypt::scrypt(password.as_bytes(), username.as_bytes(), &scrypt_params, &mut login_key.0).expect("unexpected");
-
-	login_key
 }
