@@ -37,7 +37,7 @@ async fn task_queue_insert(user: AuthenticatedUser, db: Data<Arc<Database>>, req
 	// Verify that data is valid JSON
 	match serde_json::from_str::<serde_json::Value>(&req.data) {
 		Ok(_) => {},
-		Err(e) => return Ok(HttpResponse::BadRequest().body(format!("Invalid JSON: {}", e))),
+		Err(e) => return Ok(HttpResponse::BadRequest().body(format!("Invalid JSON in data field: {}", e))),
 	}
 
 	db.add_task(req.group, req.data, req.status, user.id).await?;

@@ -500,18 +500,23 @@ async fn remove_image(db: Data<Arc<Database>>, path: web::Path<(ImageIdentifier,
 	user.verify_scope(Scope::ImagesRemove)?;
 
 	let (identifier,) = path.into_inner();
-	let images_lock = db.images.read().await;
-	let image = match identifier {
-		ImageIdentifier::Hash(hash) => db.get_image_by_hash(&hash, &images_lock).await,
-		ImageIdentifier::Id(id) => db.get_image_by_id(id, &images_lock).await,
+	let image_id = {
+		let images_lock = db.images.read().await;
+		let image = match identifier {
+			ImageIdentifier::Hash(hash) => db.get_image_by_hash(&hash, &images_lock).await,
+			ImageIdentifier::Id(id) => db.get_image_by_id(id, &images_lock).await,
+		};
+
+		let image = match image {
+			Some(image) => image,
+			None => return Ok(HttpResponse::NotFound().finish()),
+		};
+
+		image.id
 	};
 
-	let image = match image {
-		Some(image) => image,
-		None => return Ok(HttpResponse::NotFound().finish()),
-	};
 
-	if db.remove_image(image.id, user.id).await? {
+	if db.remove_image(image_id, user.id).await? {
 		// Successfully removed
 		Ok(HttpResponse::NoContent().finish())
 	} else {
@@ -737,14 +742,27 @@ async fn login(db: Data<Arc<Database>>, query: web::Json<LoginQuery>) -> Result<
 
 #[derive(Deserialize)]
 struct InvalidateTokenQuery {
-	token: UserToken,
+	token: String,
 }
 
 /// Invalidate a user token
 /// It seems to be recommended to use POST for sensitive queries, so we'll use that here instead of DELETE.
 #[actix_web::post("/users/me/tokens/invalidate")]
 async fn invalidate_user_token(db: Data<Arc<Database>>, query: web::Json<InvalidateTokenQuery>, user: AuthenticatedUser) -> Result<HttpResponse, ServerError> {
-	let token_user_id = match db.get_user_id_by_token(&query.token).await {
+	let token = {
+		let token = match hex::decode(&query.token) {
+			Ok(token) => token,
+			Err(_) => return Ok(HttpResponse::BadRequest().body("Invalid token")),
+		};
+
+		let token: [u8; 32] = match token.try_into() {
+			Ok(token) => token,
+			Err(_) => return Ok(HttpResponse::BadRequest().body("Invalid token")),
+		};
+
+		UserToken(token)
+	};
+	let token_user_id = match db.get_user_id_by_token(&token).await {
 		Some(user_id) => user_id,
 		None => return Ok(HttpResponse::NotFound().body("Token not found")),
 	};
@@ -752,7 +770,7 @@ async fn invalidate_user_token(db: Data<Arc<Database>>, query: web::Json<Invalid
 	// Check permissions
 	user.verify_scope(Scope::UsersTokensDelete(token_user_id))?;
 
-	db.invalidate_user_token(&query.token).await?;
+	db.invalidate_user_token(&token).await?;
 
 	Ok(HttpResponse::NoContent().finish())
 }
@@ -784,7 +802,7 @@ async fn change_login_key(
 
 	// Check permissions
 	user.verify_scope(Scope::UsersLoginKeyChange(user_id))?;
-
+	
 	let hashed_login_key = query.new_login_key.hash();
 	db.change_user_login_key(user_id, hashed_login_key).await?;
 
