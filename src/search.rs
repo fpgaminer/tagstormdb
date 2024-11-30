@@ -541,6 +541,10 @@ impl<'a> TreeComparison<'a> {
 					_,
 					_,
 				) => Err(ExecutionError::new::<Rule>(ExecutionErrorVariant::CannotCompareExists, self.span)),
+				// BLAME(_) * * -> Error
+				(TreeOperand::FunctionCall(TreeFunctionCall { func: TreeFunction::Blame, .. }), _, _) => {
+					Err(ExecutionError::new::<Rule>(ExecutionErrorVariant::CannotCompareExists, self.span))
+				},
 			}
 		}
 		.boxed()
@@ -623,22 +627,45 @@ impl TreeFromPair<'_> for TreeValue {
 struct TreeFunctionCall {
 	func: TreeFunction,
 	argument: TreeIdentifier,
+	value: Option<i64>,
 }
 
 impl TreeFromPair<'_> for TreeFunctionCall {
 	fn from_pair_inner(pair: pest::iterators::Pair<'_, Rule>, depth: usize) -> FromPairResult<'_, Self> {
 		assert_eq!(pair.as_rule(), Rule::function_call);
 
+		let span = pair.as_span();
 		let mut pairs = pair.into_inner();
 		let function_name = pairs.next().unwrap();
 		let argument = pairs.next().unwrap();
+		let value = match pairs.next().map(|pair| TreeValue::from_pair(pair, depth + 1)).transpose()? {
+			Some(TreeValue::Number(value)) => Some(value.into_inner().round() as i64),
+			None => None,
+			Some(TreeValue::String(_)) => {
+				return Err(pest::error::Error::new_from_span(
+					pest::error::ErrorVariant::CustomError {
+						message: "Expected number".to_string(),
+					},
+					span,
+				))
+			},
+		};
 
 		assert_eq!(argument.as_rule(), Rule::identifier);
 
-		Ok(Self {
-			func: TreeFunction::from_pair(function_name, depth + 1)?,
-			argument: TreeIdentifier::from_pair(argument, depth + 1)?,
-		})
+		let func = TreeFunction::from_pair(function_name, depth + 1)?;
+		let argument = TreeIdentifier::from_pair(argument, depth + 1)?;
+
+		if func == TreeFunction::Blame && value.is_none() {
+			return Err(pest::error::Error::new_from_span(
+				pest::error::ErrorVariant::CustomError {
+					message: "Expected blame value".to_string(),
+				},
+				span,
+			));
+		}
+
+		Ok(Self { func, argument, value })
 	}
 }
 
@@ -663,6 +690,44 @@ impl TreeFunctionCall {
 
 					Ok(set)
 				},
+				TreeFunction::Blame => {
+					// Same as EXISTS, but checks blame id
+					let attribute_key_id = match db.get_string_id(&self.argument.value).await {
+						Some(id) => id.into(),
+						None => {
+							log::info!("attribute_key_id not found for {}", self.argument.value);
+							return Ok(HashSet::new());
+						},
+					};
+
+					let value = if self.value.unwrap() < 0 {
+						return Ok(HashSet::new());
+					} else {
+						(self.value.unwrap() as u64).into()
+					};
+
+					// Find all images that have the attribute
+					let index_by_attribute = db.index_by_attribute.read().await;
+					let images = db.images.read().await;
+					let set = match index_by_attribute.get_by_key(attribute_key_id) {
+						Some(set) => set.values().flatten().filter_map(|id| images.get_by_id(*id)),
+						None => return Ok(HashSet::new()),
+					};
+
+					// Filter images by blame
+					let set = set
+						.filter_map(|image| {
+							let mut blames = image.attributes.get(&attribute_key_id)?.values();
+							if blames.any(|&blame| blame == value) {
+								Some(image.id)
+							} else {
+								None
+							}
+						})
+						.collect();
+
+					Ok(set)
+				},
 			}
 		}
 		.boxed()
@@ -670,15 +735,18 @@ impl TreeFunctionCall {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum TreeFunction {
 	Exists,
+	Blame,
 }
 
 impl<'a> TreeFromPair<'a> for TreeFunction {
 	fn from_pair_inner(pair: pest::iterators::Pair<'a, Rule>, _depth: usize) -> FromPairResult<'a, Self> {
 		match pair.as_str().to_lowercase().as_str() {
 			"exists" => Ok(TreeFunction::Exists),
+			"has" => Ok(TreeFunction::Exists),
+			"blame" => Ok(TreeFunction::Blame),
 			_ => unreachable!(),
 		}
 	}
@@ -856,6 +924,7 @@ mod tests {
 			("tag = \"portrait\"", vec![ImageId(2), ImageId(3)]),
 			("NOT tag = \"portrait\"", vec![ImageId(0), ImageId(1)]),
 			("exists(description)", vec![ImageId(1), ImageId(2)]),
+			("blame(description, 0)", vec![ImageId(1), ImageId(2)]),
 			("field = \"value\"", vec![]),
 			("", vec![ImageId(0), ImageId(1), ImageId(2), ImageId(3)]),
 		];

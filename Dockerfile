@@ -1,7 +1,7 @@
 # Build Rust API
 FROM rust:slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev
+RUN apt-get update && apt-get install -y pkg-config libssl-dev make
 
 WORKDIR /usr/src/rust-api
 COPY src ./src

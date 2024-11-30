@@ -7,6 +7,8 @@ mod server_error;
 mod tags;
 mod task_queue;
 
+use tikv_jemallocator::Jemalloc;
+
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	os::unix::fs::PermissionsExt,
@@ -49,6 +51,9 @@ use tagstormdb::{
 use task_queue::{task_queue_acquire, task_queue_delete, task_queue_finish, task_queue_insert, task_queue_view};
 use tokio::io::AsyncReadExt;
 
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const TASK_EXPIRATION_TIME: i64 = 10 * 60; // 10 minutes
@@ -802,7 +807,7 @@ async fn change_login_key(
 
 	// Check permissions
 	user.verify_scope(Scope::UsersLoginKeyChange(user_id))?;
-	
+
 	let hashed_login_key = query.new_login_key.hash();
 	db.change_user_login_key(user_id, hashed_login_key).await?;
 

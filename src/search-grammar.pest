@@ -2,9 +2,9 @@ WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 
 query = { SOI ~ expression? ~ sort_clause? ~ EOI }
 
-identifier = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+identifier = @{ !keyword ~ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* | keyword ~ (ASCII_ALPHANUMERIC | "_")* }
 
-keyword = @{ ^"AND" | ^"OR" | ^"NOT" | ^"count" | ^"exists" }
+keyword = @{ ^"AND" | ^"OR" | ^"NOT" | ^"blame" | ^"exists" | ^"has" | ^"sort" }
 
 operator = _{ op_equal | op_gte | op_lte | op_gt | op_lt }
 	op_equal = { "=" }
@@ -13,7 +13,7 @@ operator = _{ op_equal | op_gte | op_lte | op_gt | op_lt }
 	op_gte = { ">=" }
 	op_lte = { "<=" }
 
-function_name = @{ ^"exists" }
+function_name = @{ ^"exists" | ^"has" | ^"blame" }
 
 number = @{
 	"-"? ~
@@ -55,7 +55,7 @@ comparison = { operand ~ operator ~ value }
 
 operand = { function_call | identifier }
 
-function_call = { function_name ~ LPAREN ~ identifier ~ RPAREN }
+function_call = { function_name ~ LPAREN ~ identifier ~ (COMMA ~ value)? ~ RPAREN }
 
 value = { number | string }
 
