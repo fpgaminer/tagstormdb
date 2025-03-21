@@ -25,7 +25,7 @@ def main():
 	
 	# Calculate expiration timestamp
 	expiration_time = current_time + args.duration
-	print(f"Invitation code will expire at {datetime.fromtimestamp(expiration_time).strftime('%A, %B %d, %Y at %I:%M %p')}")
+	print(f"Invitation code will expire at {datetime.utcfromtimestamp(expiration_time).strftime('%A, %B %d, %Y at %I:%M %p UTC')}")
 
 	# Construct invitation code
 	expiration_time_bytes = expiration_time.to_bytes(8, byteorder='little')

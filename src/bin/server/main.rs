@@ -233,7 +233,9 @@ fn build_app(
 		.service(add_image)
 		.service(remove_image)
 		.service(add_image_attribute)
+		.service(add_image_attribute_json)
 		.service(remove_image_attribute)
+		.service(remove_image_attribute_json)
 		.service(tag_image)
 		.service(untag_image)
 		.service(login)
@@ -659,6 +661,58 @@ async fn add_image_attribute(
 }
 
 
+#[derive(Deserialize)]
+struct AddImageAttributeQuery {
+	key: String,
+	value: String,
+	singular: bool,
+}
+
+/// Add an attribute to an image
+#[actix_web::post("/images/{image}/attributes")]
+async fn add_image_attribute_json(
+	db: Data<Arc<Database>>,
+	path: web::Path<(ImageIdentifier,)>,
+	data: web::Json<AddImageAttributeQuery>,
+	user: AuthenticatedUser,
+) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	user.verify_scope(Scope::ImagesAttributesAdd)?;
+
+	let (image,) = path.into_inner();
+	let data = data.into_inner();
+	let image_id = match image {
+		ImageIdentifier::Hash(hash) => match db.get_image_id(&hash).await {
+			Some(id) => id,
+			None => return Ok(HttpResponse::NotFound().body("Image not found")),
+		},
+		ImageIdentifier::Id(id) => id,
+	};
+
+	let result = if data.singular {
+		db.add_image_attribute_singular(image_id, data.key, data.value, user.id).await?
+	} else {
+		db.add_image_attribute(image_id, data.key, data.value, user.id).await?
+	};
+
+	match result {
+		StateUpdateResult::Updated(_) => {
+			// Successfully added
+			Ok(HttpResponse::Created().finish())
+		},
+		StateUpdateResult::NoOp => {
+			// Already exists
+			Ok(HttpResponse::Conflict().finish())
+		},
+		StateUpdateResult::ErrorImageDoesNotExist => {
+			// Image not found
+			Ok(HttpResponse::NotFound().body("Image not found"))
+		},
+		StateUpdateResult::ErrorTagDoesNotExist => unreachable!(),
+	}
+}
+
+
 /// Remove an attribute from an image
 #[actix_web::delete("/images/{image}/attributes/{key}/{value}")]
 async fn remove_image_attribute(
@@ -682,6 +736,59 @@ async fn remove_image_attribute(
 		None => return Ok(HttpResponse::NotFound().body("Key not found")),
 	};
 	let value_id: AttributeValueId = match db.get_string_id(&value).await {
+		Some(id) => id.into(),
+		None => return Ok(HttpResponse::NotFound().body("Value not found")),
+	};
+
+	match db.remove_image_attribute(image_id, key_id, value_id, user.id).await? {
+		StateUpdateResult::Updated(_) => {
+			// Successfully removed
+			Ok(HttpResponse::NoContent().finish())
+		},
+		StateUpdateResult::NoOp => {
+			// Not found
+			Ok(HttpResponse::Conflict().finish())
+		},
+		StateUpdateResult::ErrorImageDoesNotExist => {
+			// Image not found
+			Ok(HttpResponse::NotFound().body("Image not found"))
+		},
+		StateUpdateResult::ErrorTagDoesNotExist => unreachable!(),
+	}
+}
+
+
+#[derive(Deserialize)]
+struct RemoveImageAttributeQuery {
+	key: String,
+	value: String,
+}
+
+/// Remove an attribute from an image
+#[actix_web::delete("/images/{image}/attributes")]
+async fn remove_image_attribute_json(
+	db: Data<Arc<Database>>,
+	path: web::Path<(ImageIdentifier,)>,
+	data: web::Json<RemoveImageAttributeQuery>,
+	user: AuthenticatedUser,
+) -> Result<HttpResponse, ServerError> {
+	// Check permissions
+	user.verify_scope(Scope::ImagesAttributesRemove)?;
+
+	let (image,) = path.into_inner();
+	let data = data.into_inner();
+	let image_id = match image {
+		ImageIdentifier::Hash(hash) => match db.get_image_id(&hash).await {
+			Some(id) => id,
+			None => return Ok(HttpResponse::NotFound().body("Image not found")),
+		},
+		ImageIdentifier::Id(id) => id,
+	};
+	let key_id: AttributeKeyId = match db.get_string_id(&data.key).await {
+		Some(id) => id.into(),
+		None => return Ok(HttpResponse::NotFound().body("Key not found")),
+	};
+	let value_id: AttributeValueId = match db.get_string_id(&data.value).await {
 		Some(id) => id.into(),
 		None => return Ok(HttpResponse::NotFound().body("Value not found")),
 	};
@@ -1105,7 +1212,8 @@ fn build_search_response(
 
 					// Image tags
 					let tags = if select.contains(&SearchSelect::Tags) {
-						builder.start_vector::<WIPOffset<flatbuffer_types::TagWithBlame>>(image.tags.len());
+						let mut tags = Vec::new();
+
 						image.tags.iter().for_each(|(tag_id, user_id)| {
 							let tag_with_blame = flatbuffer_types::TagWithBlame::create(
 								&mut builder,
@@ -1115,9 +1223,10 @@ fn build_search_response(
 								},
 							);
 
-							builder.push(&tag_with_blame);
+							tags.push(tag_with_blame);
 						});
-						Some(builder.end_vector(image.tags.len()))
+
+						Some(builder.create_vector(&tags))
 					} else {
 						None
 					};

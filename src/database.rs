@@ -1366,7 +1366,7 @@ pub enum StateUpdateResult<T> {
 }
 
 
-fn read_small_db<P: AsRef<Path>>(
+pub fn read_small_db<P: AsRef<Path>>(
 	path: P,
 ) -> Result<
 	(

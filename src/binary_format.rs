@@ -122,7 +122,7 @@ impl<R: Read> Read for HasherReader<R> {
 /// A single byte checksum is used since most logs are small (~32 bytes), which 1 byte of checksum
 /// is sufficient for.  Only AddTag is longer, as it encodes a string, but all tags should be short.
 #[derive(Debug)]
-pub(crate) struct LogEntry {
+pub struct LogEntry {
 	pub timestamp: i64,
 	pub user_id: UserId,
 	pub action: LogActionWithData,
@@ -130,7 +130,7 @@ pub(crate) struct LogEntry {
 
 impl LogEntry {
 	/// Writes this LogEntry to a writer
-	fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), DatabaseError> {
+	pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<(), DatabaseError> {
 		let mut buffer = Vec::with_capacity(32);
 
 		// Write timestamp
@@ -596,7 +596,7 @@ fn read_log_entry<R: Read>(reader: &mut HasherReader<R>) -> Result<LogEntry, Dat
 
 
 /// Append a log entry to the log file
-pub(crate) fn append_to_log_file(logs_file: &mut File, log: &LogEntry) -> Result<(), DatabaseError> {
+pub fn append_to_log_file(logs_file: &mut File, log: &LogEntry) -> Result<(), DatabaseError> {
 	// Read the current log count
 	logs_file.seek(std::io::SeekFrom::Start(0))?;
 	let log_count = match logs_file.read_u64::<LittleEndian>() {
@@ -631,14 +631,14 @@ pub(crate) fn append_to_log_file(logs_file: &mut File, log: &LogEntry) -> Result
 }
 
 
-pub(crate) struct LogsReader<R> {
+pub struct LogsReader<R> {
 	reader: HasherReader<R>,
 	pub(crate) remaining_logs: u64, // Only an estimate
 }
 
 /// Read a log file
 /// Returns a reader that yields log entries
-pub(crate) fn read_log_file<R: Read + Seek>(mut reader: R) -> Result<LogsReader<R>, DatabaseError> {
+pub fn read_log_file<R: Read + Seek>(mut reader: R) -> Result<LogsReader<R>, DatabaseError> {
 	// Read the count (may be inaccurate due to corruption, but is only used for allocation and the progress bar)
 	reader.seek(std::io::SeekFrom::Start(0))?;
 	let log_count = match reader.read_u64::<LittleEndian>() {
