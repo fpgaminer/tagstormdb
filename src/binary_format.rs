@@ -250,7 +250,7 @@ impl LogAction {
 /// Write a string to a writer
 /// The string is prefixed with its length as a variable-length integer,
 /// and then the bytes of the string are written as UTF-8.
-pub(crate) fn write_string<W: Write>(mut writer: W, s: &str) -> Result<(), std::io::Error> {
+pub fn write_string<W: Write>(mut writer: W, s: &str) -> Result<(), std::io::Error> {
 	let bytes = s.as_bytes();
 	let len = bytes.len() as u64;
 	write_vli(&mut writer, len)?;
@@ -264,7 +264,7 @@ pub(crate) fn write_string<W: Write>(mut writer: W, s: &str) -> Result<(), std::
 /// If the integer is less than or equal to 0xfc, it is written as a single byte.
 /// Otherwise, it is written as a byte followed by the integer in little-endian format.
 /// The byte is 0xfd for 16-bit integers, 0xfe for 32-bit integers, and 0xff for 64-bit integers.
-pub(crate) fn write_vli<W: Write>(mut writer: W, n: u64) -> Result<(), std::io::Error> {
+pub fn write_vli<W: Write>(mut writer: W, n: u64) -> Result<(), std::io::Error> {
 	if n <= 0xfc {
 		writer.write_all(&[n as u8])?;
 	} else if n <= 0xffff {

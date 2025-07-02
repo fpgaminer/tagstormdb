@@ -1,12 +1,11 @@
 mod auth;
 mod crypto;
-#[allow(dead_code, unused_imports)]
-#[path = "flatbuffers_generated.rs"]
-mod flatbuffers_generated;
 mod server_error;
 mod tags;
 mod task_queue;
+mod search_protocol;
 
+use search_protocol::SearchProtocolWriter;
 use tikv_jemallocator::Jemalloc;
 
 use std::{
@@ -33,8 +32,6 @@ use clap::Parser;
 use crypto::{authenticate_data, derive_key, login_key_from_password, random_password};
 use data_encoding::BASE32;
 use env_logger::Env;
-use flatbuffers::{FlatBufferBuilder, WIPOffset};
-use flatbuffers_generated::tag_storm_db as flatbuffer_types;
 use image::{imageops, ImageReader};
 use reqwest::Url;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1097,10 +1094,12 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 		return Ok(HttpResponse::InternalServerError().body("Tag IDs exceed u32"));
 	}
 
+	let start_time = std::time::Instant::now();
 	let select = query.select.clone();
 	let result = tokio::task::spawn_blocking(move || build_search_response(select, search.sort, results, images_lock, db.string_table.clone()))
 		.await
 		.unwrap();
+	log::warn!("Serialization took {:?}ms", start_time.elapsed().as_millis());
 
 	return Ok(HttpResponse::Ok().content_type("application/octet-stream").body(result));
 }
@@ -1154,142 +1153,74 @@ fn build_search_response(
 	strings_lock: Arc<StringTableRwLock>,
 ) -> Vec<u8> {
 	let images_lock = images_lock.blocking_read();
-	let mut builder = FlatBufferBuilder::new();
-	let n_results = results.len();
+	let strings_lock = strings_lock.blocking_read();
+	let mut buffer = Vec::new();
+	let mut writer = SearchProtocolWriter::new(&mut buffer);
 
 	// Sort
+	let start_time = std::time::Instant::now();
 	let sorted = SortedSearchResults::new(sort, results, &images_lock);
+	log::warn!("Sorting took {:?}ms", start_time.elapsed().as_millis());
 
 	// Serialize
 	match select.as_slice() {
 		// Only IDs
 		[SearchSelect::Id] => {
-			builder.start_vector::<u32>(n_results);
+			writer.write_header(true, false, false, false).expect("Failed to write header");
+
 			sorted.without_images().for_each(|id| {
-				builder.push(id.0 as u32);
+				writer.write_id(id.0 as u32).expect("Failed to write ID");
 			});
-			let ids_vector = builder.end_vector(n_results);
-			let id_response = flatbuffer_types::IDResponse::create(&mut builder, &flatbuffer_types::IDResponseArgs { ids: Some(ids_vector) });
-			let search_response = flatbuffer_types::SearchResultResponse::create(
-				&mut builder,
-				&flatbuffer_types::SearchResultResponseArgs {
-					data_type: flatbuffer_types::ResponseType::IDResponse,
-					data: Some(id_response.as_union_value()),
-				},
-			);
-			builder.finish(search_response, None);
 		},
 
 		// Only hashes
 		[SearchSelect::Hash] => {
-			builder.start_vector::<WIPOffset<flatbuffer_types::Hash>>(n_results);
+			writer.write_header(false, true, false, false).expect("Failed to write header");
+
 			sorted.with_images(&images_lock).for_each(|(_, hash, _)| {
-				builder.push(&flatbuffer_types::Hash(hash.0));
+				writer.write_hash(&hash.0).expect("Failed to write hash");
 			});
-			let hashes_vector = builder.end_vector(n_results);
-			let hash_response = flatbuffer_types::HashResponse::create(&mut builder, &flatbuffer_types::HashResponseArgs { hashes: Some(hashes_vector) });
-			let search_response = flatbuffer_types::SearchResultResponse::create(
-				&mut builder,
-				&flatbuffer_types::SearchResultResponseArgs {
-					data_type: flatbuffer_types::ResponseType::HashResponse,
-					data: Some(hash_response.as_union_value()),
-				},
-			);
-			builder.finish(search_response, None);
 		},
 
 		// Full objects in all other cases
 		_ => {
-			let images: Vec<_> = sorted
+			writer.write_header(select.contains(&SearchSelect::Id), select.contains(&SearchSelect::Hash), select.contains(&SearchSelect::Tags), select.contains(&SearchSelect::Attributes)).expect("Failed to write header");
+
+			sorted
 				.with_images(&images_lock)
-				.map(|(_id, hash, image)| {
+				.for_each(|(_id, hash, image)| {
+					// Image ID
+					if select.contains(&SearchSelect::Id) {
+						writer.write_id(image.id.0 as u32).expect("Failed to write ID");
+					}
+
 					// Image hash
-					let hash = if select.contains(&SearchSelect::Hash) {
-						Some(flatbuffer_types::Hash(hash.0))
-					} else {
-						None
-					};
+					if select.contains(&SearchSelect::Hash) {
+						writer.write_hash(&hash.0).expect("Failed to write hash");
+					}
 
 					// Image tags
-					let tags = if select.contains(&SearchSelect::Tags) {
-						let mut tags = Vec::new();
-
-						image.tags.iter().for_each(|(tag_id, user_id)| {
-							let tag_with_blame = flatbuffer_types::TagWithBlame::create(
-								&mut builder,
-								&flatbuffer_types::TagWithBlameArgs {
-									tag: tag_id.0 as u32,
-									blame: user_id.0 as u32,
-								},
-							);
-
-							tags.push(tag_with_blame);
-						});
-
-						Some(builder.create_vector(&tags))
-					} else {
-						None
-					};
+					if select.contains(&SearchSelect::Tags) {
+						writer.write_tags(image.tags.iter().map(|(tag_id, user_id)| (tag_id.0 as u32, user_id.0 as u32))).expect("Failed to write tags");
+					}
 
 					// Image attributes
-					let attributes = if select.contains(&SearchSelect::Attributes) {
-						let strings_lock = strings_lock.blocking_read();
-						let mut attributes = Vec::new();
-
-						image.attributes.iter().for_each(|(key_id, values)| {
+					if select.contains(&SearchSelect::Attributes) {
+						writer.write_attributes(image.attributes.iter().map(|(key_id, values)| {
 							let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
-							let key_offset = builder.create_string(key_str);
-
-							values.iter().for_each(|(value_id, user_id)| {
+							let values_iter = values.iter().map(|(value_id, user_id)| {
 								let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
-								let value_offset = builder.create_string(value_str);
-								let attribute_with_blame = flatbuffer_types::AttributeWithBlame::create(
-									&mut builder,
-									&flatbuffer_types::AttributeWithBlameArgs {
-										key: Some(key_offset),
-										value: Some(value_offset),
-										blame: user_id.0 as u32,
-									},
-								);
-
-								attributes.push(attribute_with_blame);
+								(value_str, user_id.0 as u32)
 							});
-						});
 
-						Some(builder.create_vector(&attributes))
-					} else {
-						None
-					};
-
-					let image = flatbuffers_generated::tag_storm_db::Image::create(
-						&mut builder,
-						&flatbuffers_generated::tag_storm_db::ImageArgs {
-							id: image.id.0 as u32,
-							hash: hash.as_ref(),
-							tags,
-							attributes,
-						},
-					);
-
-					image
-				})
-				.collect();
-
-			let images_vector = builder.create_vector(&images);
-
-			let image_response = flatbuffer_types::ImageResponse::create(&mut builder, &flatbuffer_types::ImageResponseArgs { images: Some(images_vector) });
-			let search_response = flatbuffer_types::SearchResultResponse::create(
-				&mut builder,
-				&flatbuffer_types::SearchResultResponseArgs {
-					data_type: flatbuffer_types::ResponseType::ImageResponse,
-					data: Some(image_response.as_union_value()),
-				},
-			);
-			builder.finish(search_response, None);
+							(key_str, values_iter)
+						})).expect("Failed to write attributes");
+					}
+				});
 		},
 	}
 
-	builder.finished_data().to_vec()
+	buffer
 }
 
 
