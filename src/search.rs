@@ -46,7 +46,7 @@ fn format_parse_tree(pairs: pest::iterators::Pairs<Rule>, indent: usize) {
 		let rule = pair.as_rule();
 		let inner = pair.into_inner();
 
-		print!("{}{:?}", indent_str, rule);
+		print!("{indent_str}{rule:?}");
 
 		if inner.clone().count() > 0 {
 			println!();
@@ -100,7 +100,7 @@ impl<'a> TreeFromPair<'a> for TreeQuery<'a> {
 				rule => {
 					return Err(pest::error::Error::new_from_span(
 						pest::error::ErrorVariant::CustomError {
-							message: format!("Unexpected rule: {:?}", rule),
+							message: format!("Unexpected rule: {rule:?}"),
 						},
 						span,
 					))
@@ -439,7 +439,7 @@ impl<'a> TreeComparison<'a> {
 					let tag_id = match db.get_tag_id(value).await {
 						Some(id) => id,
 						None => {
-							log::info!("tag_id not found for {}", value);
+							log::info!("tag_id not found for {value}");
 							return Ok(HashSet::new());
 						},
 					};
@@ -468,7 +468,7 @@ impl<'a> TreeComparison<'a> {
 						Some(id) => id.into(),
 						None => {
 							return {
-								log::info!("attribute_value_id not found for {}", value);
+								log::info!("attribute_value_id not found for {value}");
 								Ok(HashSet::new())
 							}
 						},
@@ -478,7 +478,7 @@ impl<'a> TreeComparison<'a> {
 					let set = match index_by_attribute.get_by_key_value(attribute_key_id, attribute_value_id) {
 						Some(set) => set,
 						None => {
-							log::info!("no value matches for {} = {}", attribute_key_id, attribute_value_id);
+							log::info!("no value matches for {attribute_key_id} = {attribute_value_id}");
 							return Ok(HashSet::new());
 						},
 					};
@@ -894,7 +894,7 @@ mod tests {
 		];
 
 		for query in invalid_queries.iter() {
-			assert!(parse_search(query).is_err(), "Query succeeded unexpectedly: {}", query);
+			assert!(parse_search(query).is_err(), "Query succeeded unexpectedly: {query}");
 		}
 	}
 
@@ -934,7 +934,7 @@ mod tests {
 			let result = query.execute(&db).await.unwrap();
 			let mut result_ids: Vec<_> = result.into_iter().collect();
 			result_ids.sort();
-			assert_eq!(result_ids, expected_ids, "Query failed: {}", query_str);
+			assert_eq!(result_ids, expected_ids, "Query failed: {query_str}");
 		}
 	}
 

@@ -6,3 +6,4 @@ images/
 upload/
 perf.data*
 db/
+.vscode

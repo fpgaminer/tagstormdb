@@ -37,15 +37,15 @@ impl From<small_db::DbError> for DatabaseError {
 impl std::fmt::Display for DatabaseError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::IoError(e) => write!(f, "IO error: {}", e),
-			Self::FromUtf8Error(e) => write!(f, "FromUtf8Error: {}", e),
-			Self::ChecksumMismatch { expected, actual } => write!(f, "Checksum mismatch: expected {}, actual {}", expected, actual),
+			Self::IoError(e) => write!(f, "IO error: {e}"),
+			Self::FromUtf8Error(e) => write!(f, "FromUtf8Error: {e}"),
+			Self::ChecksumMismatch { expected, actual } => write!(f, "Checksum mismatch: expected {expected}, actual {actual}"),
 			Self::CorruptedDatabase => write!(f, "Corrupted database"),
 			Self::ImageNotFound => write!(f, "Image not found"),
-			Self::ScopeParseError(e) => write!(f, "Scope parse error: {}", e),
+			Self::ScopeParseError(e) => write!(f, "Scope parse error: {e}"),
 			Self::UserAlreadyExists => write!(f, "User already exists"),
 			Self::UserDoesNotExist => write!(f, "User does not exist"),
-			Self::SmallDbError(e) => write!(f, "SmallDbError: {}", e),
+			Self::SmallDbError(e) => write!(f, "SmallDbError: {e}"),
 			Self::TableIdOverflow => write!(f, "Table ID overflow"),
 			Self::TaskIdAlreadyExists => write!(f, "Task ID already exists"),
 			Self::TaskDoesNotExist => write!(f, "Task does not exist"),

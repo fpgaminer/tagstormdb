@@ -31,7 +31,7 @@ async fn test_api_access_controls() {
 				let mut server_output = server_output.lock().await;
 				server_output.push_str(&line);
 				if !line.trim().is_empty() {
-					print!("{}", line);
+					print!("{line}");
 				}
 			}
 		});
@@ -46,7 +46,7 @@ async fn test_api_access_controls() {
 				let mut server_output = server_output.lock().await;
 				server_output.push_str(&line);
 				if !line.trim().is_empty() {
-					print!("{}", line);
+					print!("{line}");
 				}
 			}
 		});
@@ -90,15 +90,7 @@ async fn test_api_access_controls() {
 
 	// Add data needed later
 	call_api(&client, &admin_token, "tags/testtag2", Method::POST, None, StatusCode::CREATED).await;
-	call_api(
-		&client,
-		&admin_token,
-		&format!("images/{}", image2_hash),
-		Method::POST,
-		None,
-		StatusCode::CREATED,
-	)
-	.await;
+	call_api(&client, &admin_token, &format!("images/{image2_hash}"), Method::POST, None, StatusCode::CREATED).await;
 
 	test_api(
 		&client,
@@ -130,10 +122,10 @@ async fn test_api_access_controls() {
 		&client,
 		&admin_token,
 		&user_token,
-		&format!("images/{}", image1_hash),
+		&format!("images/{image1_hash}"),
 		Method::POST,
 		None,
-		&format!("images/{}", image1_hash),
+		&format!("images/{image1_hash}"),
 		Method::POST,
 		None,
 		"post/images",
@@ -143,10 +135,10 @@ async fn test_api_access_controls() {
 		&client,
 		&admin_token,
 		&user_token,
-		&format!("images/{}", image1_hash),
+		&format!("images/{image1_hash}"),
 		Method::DELETE,
 		None,
-		&format!("images/{}", image1_hash),
+		&format!("images/{image1_hash}"),
 		Method::DELETE,
 		None,
 		"delete/images",
@@ -475,7 +467,7 @@ async fn login(client: &Client, username: &str, login_key: &LoginKey) -> Option<
 }
 
 async fn call_api(client: &Client, admin_token: &str, api: &str, method: Method, body: Option<&serde_json::Value>, expected_status: StatusCode) {
-	let request = client.request(method, format!("http://127.0.0.1:7734/{}", api)).bearer_auth(admin_token);
+	let request = client.request(method, format!("http://127.0.0.1:7734/{api}")).bearer_auth(admin_token);
 
 	let request = if let Some(body) = body { request.json(body) } else { request };
 
@@ -490,6 +482,7 @@ async fn call_api(client: &Client, admin_token: &str, api: &str, method: Method,
 	);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn test_api(
 	client: &Client,
 	admin_token: &str,
@@ -507,7 +500,7 @@ async fn test_api(
 
 	// Positive test: Should succeed
 	let request = client
-		.request(positive_method, format!("http://127.0.0.1:7734/{}", positive_api))
+		.request(positive_method, format!("http://127.0.0.1:7734/{positive_api}"))
 		.bearer_auth(user_token);
 
 	let request = if let Some(body) = positive_body { request.json(body) } else { request };
@@ -524,11 +517,11 @@ async fn test_api(
 	set_user_scopes(client, admin_token, "").await;
 
 	let request = client
-		.request(negative_method, format!("http://127.0.0.1:7734/{}", negative_api))
+		.request(negative_method, format!("http://127.0.0.1:7734/{negative_api}"))
 		.bearer_auth(user_token);
 	let request = if let Some(body) = negative_body { request.json(body) } else { request };
 	let response = request.send().await.unwrap();
-	assert_eq!(response.status(), StatusCode::FORBIDDEN, "Expected {} to be forbidden", negative_api);
+	assert_eq!(response.status(), StatusCode::FORBIDDEN, "Expected {negative_api} to be forbidden");
 }
 
 async fn test_upload(client: &Client, admin_token: &str, user_token: &str, data: &[u8]) {
@@ -537,7 +530,7 @@ async fn test_upload(client: &Client, admin_token: &str, user_token: &str, data:
 	let form = reqwest::multipart::Form::new().part("file", file_part);
 	set_user_scopes(client, admin_token, "post/upload_image").await;
 	let response = client
-		.post(format!("http://127.0.0.1:7734/upload_image"))
+		.post("http://127.0.0.1:7734/upload_image".to_string())
 		.multipart(form)
 		.bearer_auth(user_token)
 		.send()
@@ -550,7 +543,7 @@ async fn test_upload(client: &Client, admin_token: &str, user_token: &str, data:
 	let form = reqwest::multipart::Form::new().part("file", file_part);
 	set_user_scopes(client, admin_token, "").await;
 	let response = client
-		.post(format!("http://127.0.0.1:7734/upload_image"))
+		.post("http://127.0.0.1:7734/upload_image".to_string())
 		.multipart(form)
 		.bearer_auth(user_token)
 		.send()
@@ -582,7 +575,7 @@ async fn create_server() -> (tokio::process::Child, LoginKey, LoginKey, tempfile
 	let server_secret: [u8; 32] = rand::rng().random(); // OsRng not needed for testing
 	std::fs::write(
 		&secrets_path,
-		&serde_json::to_vec(&json!({
+		serde_json::to_vec(&json!({
 			"server_secret": hex::encode(server_secret),
 		}))
 		.unwrap(),

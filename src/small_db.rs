@@ -70,20 +70,20 @@ pub fn debug_db<'a, T: Deserialize<'a> + fmt::Debug>(file: &mut File) {
 			Ok(len) => ((len & 1) != 0, len >> 1),
 			Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
 			Err(err) => {
-				println!("Error reading record at position {}: {}", start_position, err);
+				println!("Error reading record at position {start_position}: {err}");
 				return;
 			},
 		};
 
 		// All records must at least have space for the checksum
 		if len < 2 {
-			println!("Record too short at position {}: {}", start_position, len);
+			println!("Record too short at position {start_position}: {len}");
 			return;
 		}
 
 		// Sanity check, might need to be adjusted
 		if len > (32 * 1024 * 1024) {
-			println!("Record too long at position {}: {}", start_position, len);
+			println!("Record too long at position {start_position}: {len}");
 			return;
 		}
 
@@ -92,7 +92,7 @@ pub fn debug_db<'a, T: Deserialize<'a> + fmt::Debug>(file: &mut File) {
 		match r.read_exact(&mut buffer) {
 			Ok(_) => {},
 			Err(err) => {
-				println!("Error reading record at position {}: {}", start_position, err);
+				println!("Error reading record at position {start_position}: {err}");
 				return;
 			},
 		}
@@ -109,8 +109,7 @@ pub fn debug_db<'a, T: Deserialize<'a> + fmt::Debug>(file: &mut File) {
 		};
 
 		println!(
-			"Record at position {}: active={}, len={}, stored_checksum={}, computed_checksum={}, value={:?}",
-			start_position, active, len, stored_checksum, computed_checksum, value
+			"Record at position {start_position}: active={active}, len={len}, stored_checksum={stored_checksum}, computed_checksum={computed_checksum}, value={value:?}"
 		);
 	}
 }
@@ -157,10 +156,7 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 
 		if stored_checksum != computed_checksum {
 			return Err(DbError::CorruptDatabase(
-				format!(
-					"Checksum mismatch at position {}: stored={}, computed={}",
-					start_position, stored_checksum, computed_checksum
-				),
+				format!("Checksum mismatch at position {start_position}: stored={stored_checksum}, computed={computed_checksum}"),
 				Backtrace::capture(),
 			));
 		}
@@ -169,9 +165,9 @@ fn read_db<'a, T: Deserialize<'a>>(file: &mut File, mut callback: impl FnMut(Row
 		let record: T = match from_bytes(&buffer[..len as usize - 2]) {
 			Ok(record) => record,
 			Err(err) => {
-				println!("Error deserializing record at position {}: {:?}", start_position, err);
+				println!("Error deserializing record at position {start_position}: {err:?}");
 				for b in &buffer {
-					print!("{:02x}", b);
+					print!("{b:02x}");
 				}
 				println!();
 				return Err(DbError::from(err));
@@ -268,7 +264,7 @@ impl<T: DeserializeOwned + Serialize> SmallDb<T> {
 			reader = &reader[record_len as usize..];
 
 			// Write the record
-			log::debug!("Replaying WAL record at position {}: len={}", record_position, record_len);
+			log::debug!("Replaying WAL record at position {record_position}: len={record_len}");
 			file.seek(SeekFrom::Start(record_position))?;
 			file.write_all(data)?;
 		}
@@ -332,10 +328,7 @@ impl<T: DeserializeOwned + Serialize> SmallDb<T> {
 
 		// Internal testing: simulate power failure
 		if self._internal_use_danger_do_not_use_wal_failure_test {
-			return Err(DbError::IoError(
-				std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"),
-				Backtrace::capture(),
-			));
+			return Err(DbError::IoError(std::io::Error::other("WAL failure test"), Backtrace::capture()));
 		}
 
 		// Write the record and sync it
@@ -432,10 +425,7 @@ impl<T: DeserializeOwned + Serialize> SmallDb<T> {
 
 		// Internal testing: simulate power failure
 		if self._internal_use_danger_do_not_use_wal_failure_test {
-			return Err(DbError::IoError(
-				std::io::Error::new(std::io::ErrorKind::Other, "WAL failure test"),
-				Backtrace::capture(),
-			));
+			return Err(DbError::IoError(std::io::Error::other("WAL failure test"), Backtrace::capture()));
 		}
 
 		// Write the new record
@@ -589,7 +579,7 @@ mod tests {
 						expected.insert(rowid, row);
 					},
 					// Update
-					2..3 if expected.len() > 0 => {
+					2..3 if !expected.is_empty() => {
 						let rowid = **expected.keys().collect::<Vec<_>>().choose(&mut rng).unwrap();
 						let new_row = random_test_data();
 						let new_rowid = db.update_row(rowid, &new_row).unwrap();
@@ -597,7 +587,7 @@ mod tests {
 						expected.insert(new_rowid, new_row);
 					},
 					// Delete
-					3..4 if expected.len() > 0 => {
+					3..4 if !expected.is_empty() => {
 						let rowid = **expected.keys().collect::<Vec<_>>().choose(&mut rng).unwrap();
 						db.delete_row(rowid).unwrap();
 						expected.remove(&rowid);
@@ -607,7 +597,7 @@ mod tests {
 			}
 
 			debug_db::<TestData>(&mut db.file);
-			println!("");
+			println!();
 		}
 
 		// Reopen the database and check that all rows are as expected
@@ -694,7 +684,7 @@ mod tests {
 		// Second test, this time with a failure during an update
 		let failed_row = {
 			let mut db = SmallDb::open(&tmpdir.path().join("test.db"), |rowid, _: TestData| {
-				println!("reading: rowid: {}:", rowid);
+				println!("reading: rowid: {rowid}:");
 			})
 			.unwrap();
 
@@ -726,7 +716,7 @@ mod tests {
 					return;
 				}
 
-				let expected_row = expected.remove(&row_id).expect(format!("Row not found: {}", row_id).as_str());
+				let expected_row = expected.remove(&row_id).unwrap_or_else(|| panic!("Row not found: {row_id}"));
 				assert_eq!(row, expected_row);
 			})
 			.unwrap();
@@ -785,7 +775,7 @@ mod tests {
 		match result {
 			Ok(_) => panic!("Expected an error"),
 			Err(DbError::CorruptDatabase(_, _)) => {},
-			Err(err) => panic!("Unexpected error: {:?}", err),
+			Err(err) => panic!("Unexpected error: {err:?}"),
 		}
 	}
 

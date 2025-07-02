@@ -134,15 +134,16 @@ type StringTableRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<String, Option<
 type StringTableReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type IndexByAttributeNumericRwGuard<'a> = RwLockWriteGuard<'a, NumericAttributeIndex>;
 type UsersReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, UserEntry, UserId>>;
+#[allow(dead_code)]
 type TaskQueueReadLock<'a> = RwLockReadGuard<'a, HashMap<TaskId, (TaskEntry, RowId)>>;
 type TaskQueueWriteLock<'a> = RwLockWriteGuard<'a, HashMap<TaskId, (TaskEntry, RowId)>>;
 type SmallDbGuard = OwnedMutexGuard<SmallDb<SmallDbEntry>>;
 
 
 pub struct Database {
-	pub images: Arc<RwLock<IndexMapTyped<ImageHash, ImageEntry, ImageId>>>,
+	pub images: Arc<ImagesRwLock>,
 	pub tags: RwLock<IndexMapTyped<String, TagEntry, TagId>>,
-	pub string_table: Arc<RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>>,
+	pub string_table: Arc<StringTableRwLock>,
 	pub users: Arc<RwLock<IndexMapTyped<String, UserEntry, UserId>>>,
 	pub user_tokens: RwLock<HashMap<UserToken, (UserId, RowId)>>,
 	pub task_queue: Arc<RwLock<HashMap<TaskId, (TaskEntry, RowId)>>>,
@@ -816,7 +817,7 @@ impl Database {
 		if image
 			.attributes
 			.get(&key_id)
-			.map_or(false, |values| values.contains_key(&value_id) && values.len() == 1)
+			.is_some_and(|values| values.contains_key(&value_id) && values.len() == 1)
 		{
 			return StateUpdateResult::NoOp;
 		}
@@ -866,7 +867,7 @@ impl Database {
 		}
 
 		// If the image already has the attribute, return
-		if image.attributes.get(&key_id).map_or(false, |values| values.contains_key(&value_id)) {
+		if image.attributes.get(&key_id).is_some_and(|values| values.contains_key(&value_id)) {
 			return StateUpdateResult::NoOp;
 		}
 
@@ -901,7 +902,7 @@ impl Database {
 		}
 
 		// If the image doesn't have the attribute, return
-		if !image.attributes.get(&key_id).map_or(false, |values| values.contains_key(&value_id)) {
+		if !image.attributes.get(&key_id).is_some_and(|values| values.contains_key(&value_id)) {
 			return StateUpdateResult::NoOp;
 		}
 

@@ -25,7 +25,7 @@ where
 	Ok(serializer.output)
 }
 
-impl<'a> ser::Serializer for &'a mut Serializer {
+impl ser::Serializer for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -193,7 +193,7 @@ impl<'a> ser::Serializer for &'a mut Serializer {
 }
 
 
-impl<'a> ser::SerializeSeq for &'a mut Serializer {
+impl ser::SerializeSeq for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -209,7 +209,7 @@ impl<'a> ser::SerializeSeq for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeTuple for &'a mut Serializer {
+impl ser::SerializeTuple for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -225,7 +225,7 @@ impl<'a> ser::SerializeTuple for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
+impl ser::SerializeTupleStruct for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -241,7 +241,7 @@ impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
+impl ser::SerializeTupleVariant for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -257,7 +257,7 @@ impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeMap for &'a mut Serializer {
+impl ser::SerializeMap for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -280,7 +280,7 @@ impl<'a> ser::SerializeMap for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeStruct for &'a mut Serializer {
+impl ser::SerializeStruct for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 
@@ -296,7 +296,7 @@ impl<'a> ser::SerializeStruct for &'a mut Serializer {
 	}
 }
 
-impl<'a> ser::SerializeStructVariant for &'a mut Serializer {
+impl ser::SerializeStructVariant for &mut Serializer {
 	type Ok = ();
 	type Error = SerializeError;
 

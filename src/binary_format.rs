@@ -914,7 +914,7 @@ mod tests {
 			Err(DatabaseError::ChecksumMismatch { expected: _, actual }) => {
 				assert_eq!(actual, 0xde);
 			},
-			e => panic!("Expected checksum mismatch error, got {:?}", e),
+			e => panic!("Expected checksum mismatch error, got {e:?}"),
 		}
 	}
 

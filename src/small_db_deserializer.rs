@@ -44,7 +44,7 @@ where
 }
 
 
-impl<'de, 'a, R: Read> de::Deserializer<'de> for Deserializer<R> {
+impl<'de, R: Read> de::Deserializer<'de> for Deserializer<R> {
 	type Error = DeserializeError;
 
 	fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value>

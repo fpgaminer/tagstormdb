@@ -16,7 +16,7 @@ async fn test_database_operations() {
 
 	// Initialize the database
 	let db_path = temp_dir.path();
-	println!("Database path: {:?}", db_path);
+	println!("Database path: {db_path:?}");
 	let db = Database::open(db_path, false).await.unwrap();
 	println!("Database initialized");
 
@@ -26,13 +26,13 @@ async fn test_database_operations() {
 
 	for tag_name in &tag_names {
 		let result = db.add_tag(tag_name.to_string(), user_id).await.unwrap();
-		assert!(result, "Tag '{}' should be added", tag_name);
+		assert!(result, "Tag '{tag_name}' should be added");
 	}
 
 	// Attempt to add duplicate tags
 	for tag_name in &tag_names {
 		let result = db.add_tag(tag_name.to_string(), user_id).await.unwrap();
-		assert!(!result, "Duplicate tag '{}' should not be added", tag_name);
+		assert!(!result, "Duplicate tag '{tag_name}' should not be added");
 	}
 
 	// Check that the tags are in the database
@@ -42,7 +42,7 @@ async fn test_database_operations() {
 			let tag_id = db.get_tag_id(tag_name).await.expect("Tag ID should exist");
 			assert_eq!(tag_id, TagId(i as u64), "Tag ID should match");
 			let tag_entry = tags.get_by_id(tag_id).expect("Tag entry should exist");
-			assert!(tag_entry.active, "Tag '{}' should be active", tag_name);
+			assert!(tag_entry.active, "Tag '{tag_name}' should be active");
 		}
 	}
 
@@ -50,11 +50,11 @@ async fn test_database_operations() {
 	let tag_to_remove = "tag2";
 	let tag_id = db.get_tag_id(tag_to_remove).await.expect("Tag ID should exist");
 	let result = db.remove_tag(tag_id, user_id).await.unwrap();
-	assert!(result, "Tag '{}' should be removed", tag_to_remove);
+	assert!(result, "Tag '{tag_to_remove}' should be removed");
 
 	// Attempt to remove the same tag again
 	let result = db.remove_tag(tag_id, user_id).await.unwrap();
-	assert!(!result, "Removing the same tag '{}' again should return false", tag_to_remove);
+	assert!(!result, "Removing the same tag '{tag_to_remove}' again should return false");
 
 	// Attempt to remove a non-existent tag
 	let non_existent_tag_id = TagId(999);
@@ -65,13 +65,13 @@ async fn test_database_operations() {
 	let image_hashes: Vec<ImageHash> = vec![ImageHash([1u8; 32]), ImageHash([2u8; 32]), ImageHash([3u8; 32])];
 
 	for image_hash in &image_hashes {
-		let result = db.add_image(image_hash.clone(), user_id).await.unwrap();
+		let result = db.add_image(*image_hash, user_id).await.unwrap();
 		assert!(result, "Image should be added");
 	}
 
 	// Attempt to add duplicate images
 	for image_hash in &image_hashes {
-		let result = db.add_image(image_hash.clone(), user_id).await.unwrap();
+		let result = db.add_image(*image_hash, user_id).await.unwrap();
 		assert!(!result, "Duplicate image should not be added");
 	}
 
@@ -106,7 +106,7 @@ async fn test_database_operations() {
 	assert!(result, "Tag should be re-added");
 
 	let image_hash = image_hashes[1];
-	let result = db.add_image(image_hash.clone(), user_id).await.unwrap();
+	let result = db.add_image(image_hash, user_id).await.unwrap();
 	assert!(result, "Image should be re-added");
 
 	let image_id = db.images.read().await.get_by_key(&image_hash).expect("Image should exist").id;
@@ -144,7 +144,7 @@ async fn test_database_operations() {
 
 	// === Test adding attributes to images ===
 	let attribute_key = "size".to_string();
-	let attribute_values = vec!["small".to_string(), "medium".to_string(), "large".to_string()];
+	let attribute_values = ["small".to_string(), "medium".to_string(), "large".to_string()];
 
 	for (i, attribute_value) in attribute_values.iter().enumerate() {
 		let result = db
@@ -202,7 +202,7 @@ async fn test_database_operations() {
 	// === Test numeric attributes ===
 	// Add numeric attributes
 	let numeric_attribute_key = "score".to_string();
-	let numeric_attribute_values = vec!["1.0".to_string(), "2.5".to_string(), "3.7".to_string()];
+	let numeric_attribute_values = ["1.0".to_string(), "2.5".to_string(), "3.7".to_string()];
 
 	for (i, attribute_value) in numeric_attribute_values.iter().enumerate() {
 		let result = db
@@ -236,16 +236,16 @@ async fn test_database_operations() {
 
 	// Check that the tags are restored
 	let tags = db.tags.read().await;
-	for (_, tag_name) in tag_names.iter().enumerate() {
+	for tag_name in tag_names.iter() {
 		let tag_id = db.get_tag_id(tag_name).await.expect("Tag ID should exist");
 		let tag_entry = tags.get_by_id(tag_id).expect("Tag entry should exist");
 		let expected_active = tag_name != &"tag2";
-		assert_eq!(tag_entry.active, expected_active, "Tag '{}' active state should match", tag_name);
+		assert_eq!(tag_entry.active, expected_active, "Tag '{tag_name}' active state should match");
 	}
 
 	// Check that the images are restored
 	let images = db.images.read().await;
-	for (_, image_hash) in image_hashes.iter().enumerate() {
+	for image_hash in image_hashes.iter() {
 		let image_entry = images.get_by_key(image_hash).expect("Image should exist");
 		let expected_active = true;
 		assert_eq!(image_entry.active, expected_active, "Image active state should match");
@@ -274,6 +274,7 @@ async fn test_database_operations() {
 }
 
 
+#[allow(dead_code)]
 enum TestAction {
 	AddTag(&'static str),
 	RemoveTag(&'static str),
@@ -374,13 +375,13 @@ impl ExpectedImageState {
 	async fn check(&self, db_image: &ImageEntry, db: &Database) {
 		for tag_name in &self.tags {
 			let tag_id = db.get_tag_id(tag_name).await.expect("Tag ID should exist");
-			assert!(db_image.tags.contains_key(&tag_id), "Image should have tag '{}'", tag_name);
+			assert!(db_image.tags.contains_key(&tag_id), "Image should have tag '{tag_name}'");
 		}
 
 		let db_attributes: HashSet<_> = db_image
 			.attributes
 			.iter()
-			.flat_map(|(key_id, values)| values.iter().map(move |(value_id, _)| (*key_id, *value_id)))
+			.flat_map(|(key_id, values)| values.keys().map(|value_id| (*key_id, *value_id)))
 			.collect();
 
 		let mut expected_attributes = HashSet::new();

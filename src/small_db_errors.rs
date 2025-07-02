@@ -12,8 +12,8 @@ pub enum DbError {
 impl fmt::Display for DbError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
-			DbError::CorruptDatabase(s, backtrace) => write!(f, "Corrupt database: {}\n{}", s, backtrace),
-			DbError::IoError(e, backtrace) => write!(f, "I/O error: {}\n{}", e, backtrace),
+			DbError::CorruptDatabase(s, backtrace) => write!(f, "Corrupt database: {s}\n{backtrace}"),
+			DbError::IoError(e, backtrace) => write!(f, "I/O error: {e}\n{backtrace}"),
 		}
 	}
 }
@@ -21,8 +21,8 @@ impl fmt::Display for DbError {
 impl fmt::Debug for DbError {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
-			DbError::CorruptDatabase(s, backtrace) => write!(f, "CorruptDatabase({:?}, {})", s, backtrace),
-			DbError::IoError(e, backtrace) => write!(f, "IoError({:?}, {})", e, backtrace),
+			DbError::CorruptDatabase(s, backtrace) => write!(f, "CorruptDatabase({s:?}, {backtrace})"),
+			DbError::IoError(e, backtrace) => write!(f, "IoError({e:?}, {backtrace})"),
 		}
 	}
 }
@@ -60,8 +60,8 @@ pub enum DeserializeError {
 impl std::fmt::Display for DeserializeError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		match self {
-			DeserializeError::IoError(e) => write!(f, "{}", e),
-			DeserializeError::Custom(s) => write!(f, "{}", s),
+			DeserializeError::IoError(e) => write!(f, "{e}"),
+			DeserializeError::Custom(s) => write!(f, "{s}"),
 			DeserializeError::InvalidUtf8 => write!(f, "Invalid UTF-8"),
 		}
 	}
@@ -94,8 +94,8 @@ pub enum SerializeError {
 impl std::fmt::Display for SerializeError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		match self {
-			SerializeError::IoError(e) => write!(f, "{}", e),
-			SerializeError::Custom(s) => write!(f, "{}", s),
+			SerializeError::IoError(e) => write!(f, "{e}"),
+			SerializeError::Custom(s) => write!(f, "{s}"),
 		}
 	}
 }

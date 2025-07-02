@@ -162,7 +162,7 @@ async fn main() -> Result<(), anyhow::Error> {
 		let admin_login_key = login_key_from_password(&args.admin_user, &admin_password);
 		let admin_hashed_login_key = admin_login_key.hash();
 		let admin_user_id = database.add_user(args.admin_user, admin_hashed_login_key, args.admin_scopes).await?;
-		log::warn!("Created admin user with ID {} and password {}", admin_user_id, admin_password);
+		log::warn!("Created admin user with ID {admin_user_id} and password {admin_password}");
 	}
 
 	// Setup HTTP server
@@ -1011,7 +1011,7 @@ async fn change_user_scopes(
 
 	match db.change_user_scopes(target_user_id, new_scopes).await {
 		Ok(()) => Ok(HttpResponse::Ok().finish()),
-		Err(DatabaseError::ScopeParseError(e)) => Ok(HttpResponse::BadRequest().body(format!("Invalid scope: {}", e))),
+		Err(DatabaseError::ScopeParseError(e)) => Ok(HttpResponse::BadRequest().body(format!("Invalid scope: {e}"))),
 		Err(DatabaseError::UserDoesNotExist) => Ok(HttpResponse::NotFound().body("User not found")),
 		Err(e) => Err(e.into()),
 	}
@@ -1073,7 +1073,7 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 	let start_time = std::time::Instant::now();
 	let search = match tagstormdb::search::parse_search(&query.query) {
 		Ok(search) => search,
-		Err(e) => return Ok(HttpResponse::BadRequest().body(format!("Invalid search query: {}", e))),
+		Err(e) => return Ok(HttpResponse::BadRequest().body(format!("Invalid search query: {e}"))),
 	};
 
 	let results = match search.execute(&db).await {
@@ -1101,7 +1101,7 @@ async fn search_images(db: Data<Arc<Database>>, query: web::Query<SearchImagesQu
 		.unwrap();
 	log::warn!("Serialization took {:?}ms", start_time.elapsed().as_millis());
 
-	return Ok(HttpResponse::Ok().content_type("application/octet-stream").body(result));
+	Ok(HttpResponse::Ok().content_type("application/octet-stream").body(result))
 }
 
 
@@ -1592,7 +1592,7 @@ async fn predict_tags(
 			return Ok(HttpResponse::BadGateway().body("Prediction server may be offline"));
 		},
 		Err(err) => {
-			log::warn!("Prediction server failed: {:?}", err);
+			log::warn!("Prediction server failed: {err:?}");
 			return Ok(HttpResponse::BadGateway().body("Prediction server may be offline"));
 		},
 	};

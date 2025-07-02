@@ -13,7 +13,7 @@ impl actix_web::error::ResponseError for ServerError {
 	fn error_response(&self) -> HttpResponse {
 		match self {
 			ServerError::Anyhow(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
-			ServerError::InvalidPermissions(scope) => HttpResponse::Forbidden().body(format!("Insufficient permissions: {}", scope)),
+			ServerError::InvalidPermissions(scope) => HttpResponse::Forbidden().body(format!("Insufficient permissions: {scope}")),
 		}
 	}
 }
@@ -31,7 +31,7 @@ impl Debug for ServerError {
 	fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
 		match self {
 			ServerError::Anyhow(err) => Debug::fmt(err, formatter),
-			ServerError::InvalidPermissions(scope) => write!(formatter, "InvalidPermissions({})", scope),
+			ServerError::InvalidPermissions(scope) => write!(formatter, "InvalidPermissions({scope})"),
 		}
 	}
 }
