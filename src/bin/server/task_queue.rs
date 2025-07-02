@@ -4,7 +4,7 @@ use actix_web::{
 	web::{self, Data},
 	HttpResponse,
 };
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use tagstormdb::{
 	database::{TaskEntry, TaskStatus},
@@ -147,7 +147,7 @@ async fn task_queue_acquire(user: AuthenticatedUser, db: Data<Arc<Database>>, pa
 		.collect::<Vec<_>>();
 
 	// Grab a random task
-	let task_id = match tasks.choose(&mut rand::thread_rng()) {
+	let task_id = match tasks.choose(&mut rand::rng()) {
 		Some(task_id) => *task_id,
 		None => return Ok(HttpResponse::NotFound().body("No tasks available")),
 	};

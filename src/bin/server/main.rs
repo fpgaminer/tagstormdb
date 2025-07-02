@@ -1,9 +1,9 @@
 mod auth;
 mod crypto;
+mod search_protocol;
 mod server_error;
 mod tags;
 mod task_queue;
-mod search_protocol;
 
 use search_protocol::SearchProtocolWriter;
 use tikv_jemallocator::Jemalloc;
@@ -1184,29 +1184,37 @@ fn build_search_response(
 
 		// Full objects in all other cases
 		_ => {
-			writer.write_header(select.contains(&SearchSelect::Id), select.contains(&SearchSelect::Hash), select.contains(&SearchSelect::Tags), select.contains(&SearchSelect::Attributes)).expect("Failed to write header");
+			writer
+				.write_header(
+					select.contains(&SearchSelect::Id),
+					select.contains(&SearchSelect::Hash),
+					select.contains(&SearchSelect::Tags),
+					select.contains(&SearchSelect::Attributes),
+				)
+				.expect("Failed to write header");
 
-			sorted
-				.with_images(&images_lock)
-				.for_each(|(_id, hash, image)| {
-					// Image ID
-					if select.contains(&SearchSelect::Id) {
-						writer.write_id(image.id.0 as u32).expect("Failed to write ID");
-					}
+			sorted.with_images(&images_lock).for_each(|(_id, hash, image)| {
+				// Image ID
+				if select.contains(&SearchSelect::Id) {
+					writer.write_id(image.id.0 as u32).expect("Failed to write ID");
+				}
 
-					// Image hash
-					if select.contains(&SearchSelect::Hash) {
-						writer.write_hash(&hash.0).expect("Failed to write hash");
-					}
+				// Image hash
+				if select.contains(&SearchSelect::Hash) {
+					writer.write_hash(&hash.0).expect("Failed to write hash");
+				}
 
-					// Image tags
-					if select.contains(&SearchSelect::Tags) {
-						writer.write_tags(image.tags.iter().map(|(tag_id, user_id)| (tag_id.0 as u32, user_id.0 as u32))).expect("Failed to write tags");
-					}
+				// Image tags
+				if select.contains(&SearchSelect::Tags) {
+					writer
+						.write_tags(image.tags.iter().map(|(tag_id, user_id)| (tag_id.0 as u32, user_id.0 as u32)))
+						.expect("Failed to write tags");
+				}
 
-					// Image attributes
-					if select.contains(&SearchSelect::Attributes) {
-						writer.write_attributes(image.attributes.iter().map(|(key_id, values)| {
+				// Image attributes
+				if select.contains(&SearchSelect::Attributes) {
+					writer
+						.write_attributes(image.attributes.iter().map(|(key_id, values)| {
 							let key_str = strings_lock.get_by_id_full((*key_id).into()).unwrap().0;
 							let values_iter = values.iter().map(|(value_id, user_id)| {
 								let value_str = strings_lock.get_by_id_full((*value_id).into()).unwrap().0;
@@ -1214,9 +1222,10 @@ fn build_search_response(
 							});
 
 							(key_str, values_iter)
-						})).expect("Failed to write attributes");
-					}
-				});
+						}))
+						.expect("Failed to write attributes");
+				}
+			});
 		},
 	}
 

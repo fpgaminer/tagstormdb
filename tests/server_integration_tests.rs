@@ -1,7 +1,7 @@
 use std::{path::Path, process::Stdio, sync::Arc, thread, time::Duration};
 
 use actix_web::{dev::ServerHandle, HttpServer};
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -376,17 +376,17 @@ async fn test_api_access_controls() {
 	//test_upload(&client, admin_token, user_token, &blue_png).await;  // TODO: Server has trouble creating temporary files in temporary directories...
 
 	// Change login key
-	let user_login_key2: [u8; 32] = thread_rng().gen(); // OsRng not needed for testing
+	let user_login_key2: [u8; 32] = rand::rng().random(); // OsRng not needed for testing
 	test_api(
 		&client,
 		&admin_token,
 		&user_token,
 		"users/1/login_key",
 		Method::POST,
-		Some(&json!({"new_login_key": hex::encode(&user_login_key2)})),
+		Some(&json!({"new_login_key": hex::encode(user_login_key2)})),
 		"users/1/login_key",
 		Method::POST,
-		Some(&json!({"new_login_key": hex::encode(&user_login_key2)})),
+		Some(&json!({"new_login_key": hex::encode(user_login_key2)})),
 		"post/users/1/login_key",
 	)
 	.await;
@@ -579,7 +579,7 @@ async fn create_server() -> (tokio::process::Child, LoginKey, LoginKey, tempfile
 
 	// Write server secrets
 	let secrets_path = temp_dir.path().join("secrets.json");
-	let server_secret: [u8; 32] = thread_rng().gen(); // OsRng not needed for testing
+	let server_secret: [u8; 32] = rand::rng().random(); // OsRng not needed for testing
 	std::fs::write(
 		&secrets_path,
 		&serde_json::to_vec(&json!({
@@ -592,7 +592,7 @@ async fn create_server() -> (tokio::process::Child, LoginKey, LoginKey, tempfile
 	let (admin_login_key, user_login_key) = {
 		let database = Database::open(temp_dir.path(), true).await.expect("Failed to open database");
 		let admin_scopes = "post/users/*/scopes, get/users/*, */images/tags, */images/attributes, post/images/imgops, post/upload_image, post/users/*/tokens, */tags, */images";
-		let admin_login_key: [u8; 32] = thread_rng().gen(); // OsRng not needed for testing
+		let admin_login_key: [u8; 32] = rand::rng().random(); // OsRng not needed for testing
 		let admin_login_key = LoginKey(admin_login_key);
 		let admin_hashed_login_key = admin_login_key.hash();
 		database
@@ -600,7 +600,7 @@ async fn create_server() -> (tokio::process::Child, LoginKey, LoginKey, tempfile
 			.await
 			.expect("Failed to add admin user");
 
-		let user_login_key: [u8; 32] = thread_rng().gen(); // OsRng not needed for testing
+		let user_login_key: [u8; 32] = rand::rng().random(); // OsRng not needed for testing
 		let user_login_key = LoginKey(user_login_key);
 		let user_hashed_login_key = user_login_key.hash();
 		database

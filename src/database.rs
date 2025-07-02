@@ -14,7 +14,7 @@ use chrono::Utc;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
-use rand::{rngs::OsRng, Rng};
+use rand::{rngs::OsRng, Rng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -475,7 +475,7 @@ impl Database {
 		}
 
 		// Generate a new token
-		let token: UserToken = OsRng.gen();
+		let token: UserToken = OsRng.unwrap_err().random();
 
 		// Update the small db
 		let db_entry = SmallDbEntry::UserToken { user_id, token };

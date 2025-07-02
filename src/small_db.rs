@@ -478,7 +478,7 @@ mod tests {
 		io::{Read, Seek, SeekFrom, Write},
 	};
 
-	use rand::{seq::SliceRandom, Rng};
+	use rand::{seq::IndexedRandom, Rng};
 	use serde::{Deserialize, Serialize};
 
 	use crate::{
@@ -501,13 +501,13 @@ mod tests {
 	}
 
 	fn random_test_data() -> TestData {
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		TestData {
-			a: rng.gen(),
+			a: rng.random(),
 			b: random_string(),
-			c: (0..rng.gen_range(0..100)).map(|_| rng.gen()).collect(),
-			d: match rng.gen_range(0..2) {
-				0 => TestDataEnum::A(rng.gen()),
+			c: (0..rng.random_range(0..100)).map(|_| rng.random()).collect(),
+			d: match rng.random_range(0..2) {
+				0 => TestDataEnum::A(rng.random()),
 				1 => TestDataEnum::B(random_string()),
 				_ => unreachable!(),
 			},
@@ -515,12 +515,12 @@ mod tests {
 	}
 
 	fn random_string() -> String {
-		let mut rng = rand::thread_rng();
-		let len = rng.gen_range(1..=100);
+		let mut rng = rand::rng();
+		let len = rng.random_range(1..=100);
 		let mut s = String::with_capacity(len);
 		for _ in 0..len {
 			//s.push(rng.gen_range(b'a'..=b'z') as char);
-			s.push(rng.gen())
+			s.push(rng.random())
 		}
 		s
 	}
@@ -578,10 +578,10 @@ mod tests {
 				unreachable!();
 			})
 			.unwrap();
-			let mut rng = rand::thread_rng();
+			let mut rng = rand::rng();
 
 			for _ in 0..1024 {
-				match rng.gen_range(0..4) {
+				match rng.random_range(0..4) {
 					// Insert
 					0..2 => {
 						let row = random_test_data();

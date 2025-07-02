@@ -150,9 +150,9 @@ impl<'de> Deserialize<'de> for HashedLoginKey {
 #[derive(Debug, Clone, Copy)]
 pub struct UserToken(pub [u8; 32]);
 
-impl Distribution<UserToken> for rand::distributions::Standard {
+impl Distribution<UserToken> for rand::distr::StandardUniform {
 	fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> UserToken {
-		UserToken(rng.gen())
+		UserToken(rng.random())
 	}
 }
 

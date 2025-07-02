@@ -1,5 +1,5 @@
 use hmac::{Hmac, Mac};
-use rand::{rngs::OsRng, seq::SliceRandom};
+use rand::{rngs::OsRng, seq::IndexedRandom, TryRngCore};
 use sha2::Sha512;
 use tagstormdb::LoginKey;
 
@@ -65,7 +65,7 @@ pub(crate) fn random_password() -> String {
 	const PASSWORD_LEN: usize = 20;
 	let password = (0..PASSWORD_LEN)
 		.map(|_| {
-			let idx = CHARSET.choose(&mut OsRng).unwrap();
+			let idx = CHARSET.choose(&mut OsRng.unwrap_err()).unwrap();
 			*idx as char
 		})
 		.collect();
