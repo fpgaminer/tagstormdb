@@ -738,6 +738,11 @@ pub async fn read_log_file_stream<R: Read + Seek + Send + 'static>(
 				break;
 			}
 		}
+
+		// Send any remaining batch
+		if !batch.is_empty() {
+			let _ = tx.blocking_send(Ok(batch));
+		}
 	});
 
 	let count = count_rx.await.unwrap()?;
