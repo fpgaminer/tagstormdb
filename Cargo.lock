@@ -3397,6 +3397,7 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
  "xxhash-rust",
 ]
 

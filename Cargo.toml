@@ -44,6 +44,8 @@ tikv-jemallocator = "0.6"
 ignore = "0.4"
 futures-util = "0.3"
 foldhash = "0.2"
+tokio-stream = "0.1"
 
 [profile.release]
 debug = true
+lto = "thin"

@@ -2,7 +2,8 @@
 //! This module contains the database struct and all the methods to interact with it.
 use crate::{
 	binary_format::{
-		append_to_hash_table, append_to_log_file, append_to_strings_table, read_hash_table, read_log_file, read_string_table, LogActionWithData, LogEntry,
+		append_to_hash_table, append_to_log_file, append_to_strings_table, read_hash_table, read_log_file_stream, read_string_table, LogActionWithData,
+		LogEntry,
 	},
 	default_progress_style,
 	errors::DatabaseError,
@@ -162,13 +163,16 @@ pub struct Database {
 	hashes_file: Arc<Mutex<std::fs::File>>,
 	strings_file: Arc<Mutex<std::fs::File>>,
 	small_db: Arc<Mutex<SmallDb<SmallDbEntry>>>,
+
+	/// Other
+	pub tag_count_id: AttributeKeyId,
 }
 
 impl Database {
 	pub async fn open<P: AsRef<Path>>(path: P, with_progress: bool) -> Result<Self, DatabaseError> {
 		let path = path.as_ref().to_path_buf();
 
-		let database = task::spawn_blocking(move || -> Result<Database, DatabaseError> {
+		let mut database = task::spawn_blocking(move || -> Result<Database, DatabaseError> {
 			let hashes_file = std::fs::OpenOptions::new()
 				.create(true)
 				.read(true)
@@ -203,7 +207,12 @@ impl Database {
 
 			// Read smalldb tables
 			let start_time = std::time::Instant::now();
-			let (users, user_tokens, task_queue, small_db) = read_small_db(path.join("small_db.bin"))?;
+			let LoadedSmallDb {
+				users,
+				user_tokens,
+				task_queue,
+				small_db,
+			} = read_small_db(path.join("small_db.bin"))?;
 			log::info!("Read small db tables in {:?}", start_time.elapsed());
 			log::info!("Users: {}", users.len());
 			log::info!("User tokens: {}", user_tokens.len());
@@ -224,12 +233,16 @@ impl Database {
 				hashes_file: Arc::new(Mutex::new(hashes_file)),
 				strings_file: Arc::new(Mutex::new(strings_file)),
 				small_db: Arc::new(Mutex::new(small_db)),
+				tag_count_id: u64::MAX.into(), // Temporary placeholder
 			};
 
 			Ok(database)
 		})
 		.await
 		.expect("spawn_blocking failed")?;
+
+		// Fill in tag_count_id
+		database.tag_count_id = database.get_or_insert_string_id("tag_count".to_string()).await?.into();
 
 		// Load the database
 		let start_time = std::time::Instant::now();
@@ -241,72 +254,77 @@ impl Database {
 
 	/// Load the database from the log file
 	async fn load(&self, with_progress: bool) -> Result<(), DatabaseError> {
-		let mut logs_file = self.logs_file.lock().await;
+		let logs_file_lock = self.logs_file.lock().await;
+		let logs_file_dup = logs_file_lock.try_clone()?;
 
-		// Note: LogReader is not async, but we're in the loading phase and the blocking is small and incremental, so it shouldn't be an issue
-		let log_reader = read_log_file(BufReader::new(&mut *logs_file))?;
+		let (mut log_stream, log_count) = read_log_file_stream(BufReader::with_capacity(1024 * 1024, logs_file_dup), 16, 4096).await?;
 		let pb_target = if with_progress {
 			ProgressDrawTarget::stderr()
 		} else {
 			ProgressDrawTarget::hidden()
 		};
-		let pb = ProgressBar::with_draw_target(Some(log_reader.size_hint().0 as u64), pb_target)
+		let pb = ProgressBar::with_draw_target(Some(log_count), pb_target)
 			.with_style(default_progress_style())
 			.with_prefix("Reading logs");
-		let mut n_logs = 0u64;
 		pb.enable_steady_tick(std::time::Duration::from_millis(250));
 
-		for log in log_reader {
-			let log = log?;
+		loop {
+			let Some(batch) = log_stream.recv().await else {
+				break;
+			};
+			let batch = batch?;
+			let batch_size = batch.len();
 
-			match log.action {
-				LogActionWithData::AddTag(tag) => match self.state_add_tag(tag).await {
-					StateUpdateResult::Updated(_) => {},
-					_ => panic!("Invalid log, tag already exists"),
-				},
-				LogActionWithData::RemoveTag(tag_id) => match self.state_remove_tag(tag_id).await {
-					StateUpdateResult::Updated(_) => {},
-					_ => panic!("Invalid log, tag doesn't exist"),
-				},
-				LogActionWithData::AddImage(image_id) => {
-					let mut index_by_attribute_numeric = self.index_by_attribute_numeric.write().await;
-					let mut images = self.images.write().await;
+			for log in batch {
+				match log.action {
+					LogActionWithData::AddTag(tag) => match self.state_add_tag(tag).await {
+						StateUpdateResult::Updated(_) => {},
+						_ => panic!("Invalid log, tag already exists"),
+					},
+					LogActionWithData::RemoveTag(tag_id) => match self.state_remove_tag(tag_id).await {
+						StateUpdateResult::Updated(_) => {},
+						_ => panic!("Invalid log, tag doesn't exist"),
+					},
+					LogActionWithData::AddImage(image_id) => {
+						let mut index_by_attribute_numeric = self.index_by_attribute_numeric.write().await;
+						let mut images = self.images.write().await;
 
-					let image = images
-						.get_by_id_mut(image_id)
-						.expect("Invalid log, image hash doesn't exist for AddImage action");
-					assert_eq!(
-						self.state_add_image(image, &mut index_by_attribute_numeric).await,
-						StateUpdateResult::Updated(())
-					);
-				},
-				LogActionWithData::RemoveImage(image_id) => {
-					assert_eq!(self.state_remove_image(image_id).await, StateUpdateResult::Updated(()));
-				},
-				LogActionWithData::AddImageTag(image_id, tag_id) => {
-					assert_eq!(self.state_add_image_tag(image_id, tag_id, log.user_id).await, StateUpdateResult::Updated(()));
-				},
-				LogActionWithData::RemoveImageTag(image_id, tag_id) => {
-					assert_eq!(self.state_remove_image_tag(image_id, tag_id).await, StateUpdateResult::Updated(()));
-				},
-				LogActionWithData::AddAttribute(image_id, key_id, value_id) => {
-					assert_eq!(
-						self.state_add_image_attribute(image_id, key_id, value_id, log.user_id).await,
-						StateUpdateResult::Updated(())
-					);
-				},
-				LogActionWithData::RemoveAttribute(image_id, key, value) => {
-					assert_eq!(self.state_remove_image_attribute(image_id, key, value).await, StateUpdateResult::Updated(()));
-				},
+						let image = images
+							.get_by_id_mut(image_id)
+							.expect("Invalid log, image hash doesn't exist for AddImage action");
+						assert_eq!(
+							self.state_add_image(image, &mut index_by_attribute_numeric).await,
+							StateUpdateResult::Updated(())
+						);
+					},
+					LogActionWithData::RemoveImage(image_id) => {
+						assert_eq!(self.state_remove_image(image_id).await, StateUpdateResult::Updated(()));
+					},
+					LogActionWithData::AddImageTag(image_id, tag_id) => {
+						assert_eq!(self.state_add_image_tag(image_id, tag_id, log.user_id).await, StateUpdateResult::Updated(()));
+					},
+					LogActionWithData::RemoveImageTag(image_id, tag_id) => {
+						assert_eq!(self.state_remove_image_tag(image_id, tag_id).await, StateUpdateResult::Updated(()));
+					},
+					LogActionWithData::AddAttribute(image_id, key_id, value_id) => {
+						assert_eq!(
+							self.state_add_image_attribute(image_id, key_id, value_id, log.user_id).await,
+							StateUpdateResult::Updated(())
+						);
+					},
+					LogActionWithData::RemoveAttribute(image_id, key, value) => {
+						assert_eq!(self.state_remove_image_attribute(image_id, key, value).await, StateUpdateResult::Updated(()));
+					},
+				}
 			}
 
-			// Only update progress bar every 1024 logs to reduce overhead
-			n_logs += 1;
-			if n_logs.is_multiple_of(1024) {
-				pb.set_position(n_logs);
-			}
+			// Only update progress bar after every batch to reduce overhead
+			pb.inc(batch_size as u64);
 		}
 		pb.finish_and_clear();
+
+		// Hold onto the lock until we're done so we are confident the duplicate handle is closed
+		drop(logs_file_lock);
 
 		Ok(())
 	}
@@ -676,9 +694,8 @@ impl Database {
 		image.active = true;
 
 		// Update tag count virtual attribute
-		let tag_count_id: AttributeKeyId = self.get_or_insert_string_id("tag_count".to_string()).await.unwrap().into();
 		let tag_count = NotNan::new(image.tags.len() as f32).unwrap();
-		index_attribute_numeric.add(tag_count_id, tag_count, image_id);
+		index_attribute_numeric.add(self.tag_count_id, tag_count, image_id);
 
 		StateUpdateResult::Updated(())
 	}
@@ -690,7 +707,6 @@ impl Database {
 		let mut index_by_tag = self.index_by_tag.write().await;
 		let mut index_by_attribute_numeric = self.index_by_attribute_numeric.write().await;
 		let mut index_by_attribute = self.index_by_attribute.write().await;
-		let tag_count_id: AttributeKeyId = self.get_or_insert_string_id("tag_count".to_string()).await.unwrap().into();
 		let string_table = self.string_table.read().await;
 
 		let image = match images.get_by_id_mut(image_id) {
@@ -706,7 +722,7 @@ impl Database {
 		index_by_tag.remove_image(image);
 		index_by_attribute_numeric.remove_image(image, &string_table);
 		index_by_attribute.remove_image(image);
-		index_by_attribute_numeric.remove(tag_count_id, NotNan::new(image.tags.len() as f32).unwrap(), image_id);
+		index_by_attribute_numeric.remove(self.tag_count_id, NotNan::new(image.tags.len() as f32).unwrap(), image_id);
 
 		// Deactivate image and clear tags and attributes
 		image.active = false;
@@ -755,9 +771,8 @@ impl Database {
 		index_by_tag.add(tag_id, image_id);
 
 		// Update the tag count virtual attribute
-		let tag_count_key_id: AttributeKeyId = self.get_string_id("tag_count").await.unwrap().into();
-		index_by_attribute_numeric.remove(tag_count_key_id, old_tag_count, image_id);
-		index_by_attribute_numeric.add(tag_count_key_id, new_tag_count, image_id);
+		index_by_attribute_numeric.remove(self.tag_count_id, old_tag_count, image_id);
+		index_by_attribute_numeric.add(self.tag_count_id, new_tag_count, image_id);
 
 		StateUpdateResult::Updated(())
 	}
@@ -793,9 +808,8 @@ impl Database {
 		index_by_tag.remove(tag_id, image_id);
 
 		// Update the tag count virtual attribute
-		let tag_count_key_id: AttributeKeyId = self.get_string_id("tag_count").await.unwrap().into();
-		index_by_attribute_numeric.remove(tag_count_key_id, old_tag_count, image_id);
-		index_by_attribute_numeric.add(tag_count_key_id, new_tag_count, image_id);
+		index_by_attribute_numeric.remove(self.tag_count_id, old_tag_count, image_id);
+		index_by_attribute_numeric.add(self.tag_count_id, new_tag_count, image_id);
 
 		StateUpdateResult::Updated(())
 	}
@@ -1398,17 +1412,15 @@ pub enum StateUpdateResult<T> {
 }
 
 
-pub fn read_small_db<P: AsRef<Path>>(
-	path: P,
-) -> Result<
-	(
-		IndexMapTyped<String, UserEntry, UserId>,
-		HashMap<UserToken, (UserId, RowId)>,
-		HashMap<TaskId, (TaskEntry, RowId)>,
-		SmallDb<SmallDbEntry>,
-	),
-	DatabaseError,
-> {
+pub struct LoadedSmallDb {
+	pub users: IndexMapTyped<String, UserEntry, UserId>,
+	pub user_tokens: HashMap<UserToken, (UserId, RowId)>,
+	pub task_queue: HashMap<TaskId, (TaskEntry, RowId)>,
+	pub small_db: SmallDb<SmallDbEntry>,
+}
+
+
+pub fn read_small_db<P: AsRef<Path>>(path: P) -> Result<LoadedSmallDb, DatabaseError> {
 	let mut users = BTreeMap::new();
 	let mut user_tokens = HashMap::new();
 	let mut task_queue = HashMap::new();
@@ -1443,5 +1455,10 @@ pub fn read_small_db<P: AsRef<Path>>(
 		users_indexmap.insert(username, user_entry);
 	}
 
-	Ok((users_indexmap, user_tokens, task_queue, small_db))
+	Ok(LoadedSmallDb {
+		users: users_indexmap,
+		user_tokens,
+		task_queue,
+		small_db,
+	})
 }

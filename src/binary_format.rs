@@ -79,6 +79,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use foldhash::HashMapExt as _;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
+use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
 
 
@@ -668,7 +669,7 @@ impl<R: Read> Iterator for LogsReader<R> {
 	fn next(&mut self) -> Option<Self::Item> {
 		match read_log_entry(&mut self.reader) {
 			Ok(log) => {
-				self.remaining_logs -= 1;
+				self.remaining_logs = self.remaining_logs.saturating_sub(1);
 				Some(Ok(log))
 			},
 			// EOF
@@ -682,6 +683,66 @@ impl<R: Read> Iterator for LogsReader<R> {
 	fn size_hint(&self) -> (usize, Option<usize>) {
 		(self.remaining_logs as usize, Some(self.remaining_logs as usize))
 	}
+}
+
+
+/// Runs the log reader in a background blocking task, and returns an async stream of log entries
+/// Logs are returned in batches to improve performance
+/// queue_capacity specifies the maximum number of batches to buffer
+pub async fn read_log_file_stream<R: Read + Seek + Send + 'static>(
+	reader: R,
+	queue_capacity: usize,
+	batch_size: usize,
+) -> Result<(mpsc::Receiver<Result<Vec<LogEntry>, DatabaseError>>, u64), DatabaseError> {
+	let (tx, rx) = mpsc::channel::<Result<Vec<LogEntry>, DatabaseError>>(queue_capacity);
+	let (count_tx, count_rx) = oneshot::channel();
+
+	tokio::task::spawn_blocking(move || {
+		// Build the iterator
+		let mut logs = match read_log_file(reader) {
+			Ok(l) => l,
+			Err(e) => {
+				let _ = count_tx.send(Err(e));
+				return;
+			},
+		};
+
+		// Report the estimate once
+		let _ = count_tx.send(Ok(logs.remaining_logs));
+
+		// Pump entries until EOF / error / receiver dropped
+		let mut batch = Vec::with_capacity(batch_size);
+
+		for item in &mut logs {
+			let err = match item {
+				Ok(item) => {
+					batch.push(item);
+					None
+				},
+				Err(e) => Some(Err(e)),
+			};
+
+			// If the batch is full or there was an error, send the batch
+			// We send the batch before the error so that the error lines up correctly in the stream
+			if batch.len() >= batch_size || err.is_some() {
+				// Send the batch
+				if tx.blocking_send(Ok(std::mem::take(&mut batch))).is_err() {
+					break;
+				}
+				batch = Vec::with_capacity(batch_size);
+			}
+
+			// If there was an error, send it and stop
+			if let Some(err) = err {
+				let _ = tx.blocking_send(err);
+				break;
+			}
+		}
+	});
+
+	let count = count_rx.await.unwrap()?;
+
+	Ok((rx, count))
 }
 
 
