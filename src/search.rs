@@ -23,7 +23,7 @@ const MAX_DEPTH: usize = 32;
 pub struct SearchParser;
 
 
-pub fn parse_search(input: &str) -> Result<TreeQuery, pest::error::Error<Rule>> {
+pub fn parse_search(input: &str) -> Result<TreeQuery<'_>, pest::error::Error<Rule>> {
 	// Parse the input
 	let mut pairs = SearchParser::parse(Rule::query, input)?;
 
