@@ -1,6 +1,6 @@
 /target
 *.bin
-/tag_*.json
+*.json
 /tag_*.txt
 images/
 upload/

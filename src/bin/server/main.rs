@@ -9,7 +9,7 @@ use search_protocol::SearchProtocolWriter;
 use tikv_jemallocator::Jemalloc;
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
 	str::FromStr,
@@ -333,7 +333,7 @@ struct ImageMetadata<'a> {
 	id: ImageId,
 	hash: ImageHash,
 	active: bool,
-	tags: HashMap<TagId, UserId>,
+	tags: foldhash::HashMap<TagId, UserId>,
 	attributes: HashMap<&'a str, HashMap<&'a str, UserId>>,
 }
 
@@ -1111,7 +1111,7 @@ enum SortedSearchResults<'a> {
 }
 
 impl<'a> SortedSearchResults<'a> {
-	fn new(sort: Option<TreeSort>, results: HashSet<ImageId>, images_lock: &'a ImagesReadGuard) -> Self {
+	fn new(sort: Option<TreeSort>, results: foldhash::HashSet<ImageId>, images_lock: &'a ImagesReadGuard) -> Self {
 		match sort {
 			Some(TreeSort::Id) => {
 				let results: BTreeSet<ImageId> = results.into_iter().collect();
@@ -1148,7 +1148,7 @@ impl<'a> SortedSearchResults<'a> {
 fn build_search_response(
 	select: Vec<SearchSelect>,
 	sort: Option<TreeSort>,
-	results: HashSet<ImageId>,
+	results: foldhash::HashSet<ImageId>,
 	images_lock: Arc<ImagesRwLock>,
 	strings_lock: Arc<StringTableRwLock>,
 ) -> Vec<u8> {

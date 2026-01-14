@@ -3,7 +3,9 @@
 //! The search query parser is implemented using the pest crate, which is a PEG parser generator.
 //!
 //! The parser generates an abstract syntax tree (AST) that can then be executed to search through the images in the database.
-use std::collections::HashSet;
+//!
+//! NOTE: Makes use of foldhash for maps/sets for better performance. They are over internal IDs, which are difficult to control in the context of hash collisions.
+use foldhash::{HashSet, HashSetExt as _};
 
 use futures::{future::BoxFuture, FutureExt};
 use ordered_float::NotNan;
@@ -379,7 +381,7 @@ impl<'a> TreeComparison<'a> {
 					let set = match operator {
 						TreeOperator::Equal => {
 							if id >= 0 && (id as u64) < n_images {
-								HashSet::from([ImageId(id as u64)])
+								HashSet::from_iter([ImageId(id as u64)])
 							} else {
 								HashSet::new()
 							}
@@ -426,7 +428,7 @@ impl<'a> TreeComparison<'a> {
 
 					if hex::decode_to_slice(value, &mut image_hash.0).is_ok() {
 						if let Some(image_id) = db.images.read().await.get_id_of(&image_hash) {
-							Ok(HashSet::from([image_id]))
+							Ok(HashSet::from_iter([image_id]))
 						} else {
 							Ok(HashSet::new())
 						}

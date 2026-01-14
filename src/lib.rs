@@ -34,13 +34,16 @@ pub mod small_db_serializer;
 
 pub use database::Database;
 
+use foldhash::HashMapExt as _;
 use indexmap::{Equivalent, IndexMap};
 use indicatif::ProgressStyle;
 use ordered_float::NotNan;
 use rand::prelude::Distribution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{borrow::Cow, collections::BTreeMap};
+
+use crate::database::{ImageEntry, StringTableReadGuard};
 
 
 /// Assert that usize is 64 bits or more, since we need to cast between u64 and usize
@@ -48,9 +51,28 @@ const _: () = assert!(std::mem::size_of::<usize>() >= 8, "usize must be 64 bits 
 
 
 pub fn default_progress_style() -> ProgressStyle {
-	ProgressStyle::with_template("{prefix:>12.cyan.bold} [{elapsed_precise}] [{wide_bar:40.cyan/blue}] {pos}/{len} ({eta})")
+	ProgressStyle::with_template("{prefix:>12.cyan.bold} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
 		.unwrap()
 		.progress_chars("#>-")
+}
+
+
+pub fn progress_bar_with_default_style<L>(length: Option<L>, msg: Option<impl Into<Cow<'static, str>>>) -> indicatif::ProgressBar
+where
+	L: TryInto<u64>,
+	L::Error: std::fmt::Debug,
+{
+	let length = length.map(|l| l.try_into().expect("Progress bar length must fit in u64"));
+	let pb = match length {
+		Some(len) => indicatif::ProgressBar::new(len),
+		None => indicatif::ProgressBar::new_spinner(),
+	};
+	pb.set_style(default_progress_style());
+	if let Some(msg) = msg {
+		pb.set_message(msg);
+	}
+	pb.enable_steady_tick(std::time::Duration::from_millis(100));
+	pb
 }
 
 
@@ -207,7 +229,7 @@ define_id_type!(TaskId);
 /// Wraps IndexMap to enforce that the index is of type I
 #[derive(Debug)]
 pub struct IndexMapTyped<K, V, I> {
-	map: IndexMap<K, V>,
+	map: IndexMap<K, V, foldhash::fast::RandomState>,
 	_phantom: std::marker::PhantomData<I>,
 }
 
@@ -218,14 +240,14 @@ where
 {
 	fn new() -> Self {
 		Self {
-			map: IndexMap::new(),
+			map: IndexMap::with_hasher(foldhash::fast::RandomState::default()),
 			_phantom: std::marker::PhantomData,
 		}
 	}
 
 	fn with_capacity(capacity: usize) -> Self {
 		Self {
-			map: IndexMap::with_capacity(capacity),
+			map: IndexMap::with_capacity_and_hasher(capacity, foldhash::fast::RandomState::default()),
 			_phantom: std::marker::PhantomData,
 		}
 	}
@@ -266,7 +288,7 @@ where
 		self.map.get_full(key).map(|(id, key, value)| (id.into(), key, value))
 	}
 
-	pub fn entry_by_key(&mut self, key: K) -> indexmap::map::Entry<K, V> {
+	pub fn entry_by_key(&mut self, key: K) -> indexmap::map::Entry<'_, K, V> {
 		self.map.entry(key)
 	}
 
@@ -286,11 +308,11 @@ where
 		self.map.get_index_of(key).map(|id| id.into())
 	}
 
-	pub fn values(&self) -> indexmap::map::Values<K, V> {
+	pub fn values(&self) -> indexmap::map::Values<'_, K, V> {
 		self.map.values()
 	}
 
-	pub fn iter(&self) -> indexmap::map::Iter<K, V> {
+	pub fn iter(&self) -> indexmap::map::Iter<'_, K, V> {
 		self.map.iter()
 	}
 
@@ -308,12 +330,14 @@ where
 /// Wraps HashMap to restrict actions
 pub struct TagIndex {
 	/// tag id -> Id's of images that have the tag
-	index: HashMap<TagId, HashSet<ImageId>>,
+	index: foldhash::HashMap<TagId, foldhash::HashSet<ImageId>>,
 }
 
 impl TagIndex {
 	fn new() -> Self {
-		Self { index: HashMap::new() }
+		Self {
+			index: foldhash::HashMap::new(),
+		}
 	}
 
 	fn add(&mut self, tag_id: TagId, image_id: ImageId) {
@@ -324,7 +348,7 @@ impl TagIndex {
 		self.index.get_mut(&tag_id).unwrap().remove(&image_id);
 	}
 
-	fn get(&self, tag_id: TagId) -> Option<&HashSet<ImageId>> {
+	fn get(&self, tag_id: TagId) -> Option<&foldhash::HashSet<ImageId>> {
 		self.index.get(&tag_id)
 	}
 
@@ -332,9 +356,9 @@ impl TagIndex {
 		self.index.remove(&tag_id);
 	}
 
-	fn remove_image(&mut self, image_id: ImageId) {
-		for (_, image_ids) in self.index.iter_mut() {
-			image_ids.remove(&image_id);
+	fn remove_image(&mut self, image: &ImageEntry) {
+		for tag_id in image.tags.keys() {
+			self.index.get_mut(tag_id).unwrap().remove(&image.id);
 		}
 	}
 }
@@ -344,12 +368,14 @@ impl TagIndex {
 #[derive(Debug)]
 pub struct AttributeIndex {
 	/// attribute key id -> attribute value id -> Id's of images that have the attribute
-	index: HashMap<AttributeKeyId, HashMap<AttributeValueId, HashSet<ImageId>>>,
+	index: foldhash::HashMap<AttributeKeyId, foldhash::HashMap<AttributeValueId, foldhash::HashSet<ImageId>>>,
 }
 
 impl AttributeIndex {
 	fn new() -> Self {
-		Self { index: HashMap::new() }
+		Self {
+			index: foldhash::HashMap::new(),
+		}
 	}
 
 	fn add(&mut self, key_id: AttributeKeyId, value_id: AttributeValueId, image_id: ImageId) {
@@ -360,19 +386,20 @@ impl AttributeIndex {
 		self.index.get_mut(&key_id).unwrap().get_mut(&value_id).unwrap().remove(&image_id);
 	}
 
-	fn remove_image(&mut self, image_id: ImageId) {
-		for (_, values) in self.index.iter_mut() {
-			for (_, image_ids) in values.iter_mut() {
-				image_ids.remove(&image_id);
+	fn remove_image(&mut self, image: &ImageEntry) {
+		for (key_id, value_ids) in image.attributes.iter() {
+			let key_map = self.index.get_mut(key_id).unwrap();
+			for value_id in value_ids.keys() {
+				key_map.get_mut(value_id).unwrap().remove(&image.id);
 			}
 		}
 	}
 
-	fn get_by_key(&self, key_id: AttributeKeyId) -> Option<&HashMap<AttributeValueId, HashSet<ImageId>>> {
+	fn get_by_key(&self, key_id: AttributeKeyId) -> Option<&foldhash::HashMap<AttributeValueId, foldhash::HashSet<ImageId>>> {
 		self.index.get(&key_id)
 	}
 
-	fn get_by_key_value(&self, key_id: AttributeKeyId, value_id: AttributeValueId) -> Option<&HashSet<ImageId>> {
+	fn get_by_key_value(&self, key_id: AttributeKeyId, value_id: AttributeValueId) -> Option<&foldhash::HashSet<ImageId>> {
 		self.index.get(&key_id).and_then(|values| values.get(&value_id))
 	}
 }
@@ -381,12 +408,14 @@ impl AttributeIndex {
 /// Wraps HashMap to restrict actions
 pub struct NumericAttributeIndex {
 	/// attribute key id -> attribute value -> Id's of images that have the attribute
-	index: HashMap<AttributeKeyId, BTreeMap<NotNan<f32>, HashSet<ImageId>>>,
+	index: foldhash::HashMap<AttributeKeyId, BTreeMap<NotNan<f32>, foldhash::HashSet<ImageId>>>,
 }
 
 impl NumericAttributeIndex {
 	fn new() -> Self {
-		Self { index: HashMap::new() }
+		Self {
+			index: foldhash::HashMap::new(),
+		}
 	}
 
 	fn add(&mut self, key_id: AttributeKeyId, value: NotNan<f32>, image_id: ImageId) {
@@ -397,15 +426,22 @@ impl NumericAttributeIndex {
 		self.index.get_mut(&key_id).unwrap().get_mut(&value).unwrap().remove(&image_id);
 	}
 
-	fn remove_image(&mut self, image_id: ImageId) {
-		for (_, values) in self.index.iter_mut() {
-			for (_, image_ids) in values.iter_mut() {
-				image_ids.remove(&image_id);
+	fn remove_image<'a>(&mut self, image: &ImageEntry, string_table_lock: &'a StringTableReadGuard<'a>) {
+		for (key_id, value_ids) in image.attributes.iter() {
+			// Not all attributes are numeric, so it's okay if the key is not present
+			let Some(key_map) = self.index.get_mut(key_id) else {
+				continue;
+			};
+
+			for value_id in value_ids.keys() {
+				if let Some(value_float) = string_table_lock.get_by_id((*value_id).into()).unwrap() {
+					key_map.get_mut(value_float).unwrap().remove(&image.id);
+				}
 			}
 		}
 	}
 
-	pub fn get_by_key(&self, key_id: AttributeKeyId) -> Option<&BTreeMap<NotNan<f32>, HashSet<ImageId>>> {
+	pub fn get_by_key(&self, key_id: AttributeKeyId) -> Option<&BTreeMap<NotNan<f32>, foldhash::HashSet<ImageId>>> {
 		self.index.get(&key_id)
 	}
 }

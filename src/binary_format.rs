@@ -67,7 +67,6 @@
 //! - ...
 //!
 use std::{
-	collections::HashMap,
 	fs::File,
 	io::{Read, Seek, Write},
 };
@@ -77,6 +76,7 @@ use crate::{
 	UserId,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use foldhash::HashMapExt as _;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
 use xxhash_rust::xxh3::{xxh3_64, Xxh3};
@@ -330,6 +330,7 @@ pub fn read_string_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> 
 		.with_prefix("Reading string table");
 	let mut table = IndexMapTyped::with_capacity(num_strings);
 	let mut reader = HasherReader::new(reader, Xxh3::new());
+	let mut n_strings_read = 0u64;
 	pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
 	loop {
@@ -348,7 +349,10 @@ pub fn read_string_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> 
 			Err(e) => return Err(e.into()),
 		};
 
-		pb.inc(1);
+		n_strings_read += 1;
+		if n_strings_read.is_multiple_of(1024) {
+			pb.set_position(n_strings_read);
+		}
 
 		if calculated_checksum != stored_checksum {
 			return Err(DatabaseError::ChecksumMismatch {
@@ -460,8 +464,8 @@ pub fn read_hash_table<R: Read + Seek>(mut reader: R, with_progress: bool) -> Re
 		let image = ImageEntry {
 			id: ImageId(entry.index() as u64),
 			hash: image_hash,
-			tags: HashMap::new(),
-			attributes: HashMap::new(),
+			tags: foldhash::HashMap::new(),
+			attributes: foldhash::HashMap::new(),
 			active: false,
 		};
 		entry.or_insert(image);

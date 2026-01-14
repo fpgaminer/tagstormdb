@@ -11,6 +11,7 @@ use crate::{
 	TaskId, UserId, UserToken,
 };
 use chrono::Utc;
+use foldhash::HashMapExt as _;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use ordered_float::NotNan;
@@ -28,12 +29,13 @@ use tokio::{
 };
 
 
+// We use foldhash for better performance; the ids used here are not easily controlled by attackers in the context of hash collisions.
 #[derive(Debug)]
 pub struct ImageEntry {
 	pub id: ImageId,
 	pub hash: ImageHash,
-	pub tags: HashMap<TagId, UserId>,                                           // tag_id -> blame
-	pub attributes: HashMap<AttributeKeyId, HashMap<AttributeValueId, UserId>>, // key_id -> value_id -> blame
+	pub tags: foldhash::HashMap<TagId, UserId>,                                                     // tag_id -> blame
+	pub attributes: foldhash::HashMap<AttributeKeyId, foldhash::HashMap<AttributeValueId, UserId>>, // key_id -> value_id -> blame
 	pub active: bool,
 }
 
@@ -131,7 +133,7 @@ type ImagesRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<ImageHash, ImageEntr
 pub type ImagesReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<ImageHash, ImageEntry, ImageId>>;
 pub type StringTableRwLock = RwLock<IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type StringTableRwGuard<'a> = RwLockWriteGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
-type StringTableReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
+pub type StringTableReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, Option<NotNan<f32>>, StringId>>;
 type IndexByAttributeNumericRwGuard<'a> = RwLockWriteGuard<'a, NumericAttributeIndex>;
 type UsersReadGuard<'a> = RwLockReadGuard<'a, IndexMapTyped<String, UserEntry, UserId>>;
 #[allow(dead_code)]
@@ -251,7 +253,8 @@ impl Database {
 		let pb = ProgressBar::with_draw_target(Some(log_reader.size_hint().0 as u64), pb_target)
 			.with_style(default_progress_style())
 			.with_prefix("Reading logs");
-		pb.enable_steady_tick(std::time::Duration::from_millis(100));
+		let mut n_logs = 0u64;
+		pb.enable_steady_tick(std::time::Duration::from_millis(250));
 
 		for log in log_reader {
 			let log = log?;
@@ -297,8 +300,13 @@ impl Database {
 				},
 			}
 
-			pb.inc(1);
+			// Only update progress bar every 1024 logs to reduce overhead
+			n_logs += 1;
+			if n_logs.is_multiple_of(1024) {
+				pb.set_position(n_logs);
+			}
 		}
+		pb.finish_and_clear();
 
 		Ok(())
 	}
@@ -555,8 +563,8 @@ impl Database {
 		Ok(entry.insert(ImageEntry {
 			id: image_id,
 			hash,
-			tags: HashMap::new(),
-			attributes: HashMap::new(),
+			tags: foldhash::HashMap::new(),
+			attributes: foldhash::HashMap::new(),
 			active: false,
 		}))
 	}
@@ -682,6 +690,8 @@ impl Database {
 		let mut index_by_tag = self.index_by_tag.write().await;
 		let mut index_by_attribute_numeric = self.index_by_attribute_numeric.write().await;
 		let mut index_by_attribute = self.index_by_attribute.write().await;
+		let tag_count_id: AttributeKeyId = self.get_or_insert_string_id("tag_count".to_string()).await.unwrap().into();
+		let string_table = self.string_table.read().await;
 
 		let image = match images.get_by_id_mut(image_id) {
 			// Image exists and is active, continue
@@ -692,15 +702,16 @@ impl Database {
 			None => return StateUpdateResult::NoOp,
 		};
 
-		// At this point the image exists and is active, so deactivate it
+		// Remove from indexes
+		index_by_tag.remove_image(image);
+		index_by_attribute_numeric.remove_image(image, &string_table);
+		index_by_attribute.remove_image(image);
+		index_by_attribute_numeric.remove(tag_count_id, NotNan::new(image.tags.len() as f32).unwrap(), image_id);
+
+		// Deactivate image and clear tags and attributes
 		image.active = false;
 		image.tags.clear();
 		image.attributes.clear();
-
-		// Remove from indexes
-		index_by_tag.remove_image(image_id);
-		index_by_attribute_numeric.remove_image(image_id);
-		index_by_attribute.remove_image(image_id);
 
 		StateUpdateResult::Updated(())
 	}
@@ -1176,6 +1187,16 @@ impl Database {
 		let key_id: AttributeKeyId = self.get_or_insert_string_id(key).await?.into();
 		let value_id: AttributeValueId = self.get_or_insert_string_id(value).await?.into();
 
+		self._add_image_attribute_singular(image_id, key_id, value_id, user_id).await
+	}
+
+	pub async fn _add_image_attribute_singular(
+		&self,
+		image_id: ImageId,
+		key_id: AttributeKeyId,
+		value_id: AttributeValueId,
+		user_id: UserId,
+	) -> Result<StateUpdateResult<()>, DatabaseError> {
 		let removed_values = match self.state_add_image_attribute_singular(image_id, key_id, value_id, user_id).await {
 			// If the image already has the attribute, return
 			StateUpdateResult::NoOp => return Ok(StateUpdateResult::NoOp),
@@ -1220,6 +1241,16 @@ impl Database {
 		let key_id: AttributeKeyId = self.get_or_insert_string_id(key).await?.into();
 		let value_id: AttributeValueId = self.get_or_insert_string_id(value).await?.into();
 
+		self._add_image_attribute(image_id, key_id, value_id, user_id).await
+	}
+
+	pub async fn _add_image_attribute(
+		&self,
+		image_id: ImageId,
+		key_id: AttributeKeyId,
+		value_id: AttributeValueId,
+		user_id: UserId,
+	) -> Result<StateUpdateResult<()>, DatabaseError> {
 		match self.state_add_image_attribute(image_id, key_id, value_id, user_id).await {
 			// If the image already has the attribute, return
 			StateUpdateResult::NoOp => return Ok(StateUpdateResult::NoOp),
