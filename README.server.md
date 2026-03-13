@@ -28,6 +28,7 @@ The server is basically just an API server for tag-machine and handles interacti
 		.service(list_user_tokens)
 		.service(change_user_scopes)
 		.service(search_images)
+		.service(count_tokens)
 		.service(upload_image)
 		.service(imgops_upload)
 		.service(create_user)
@@ -186,6 +187,28 @@ Removes an attribute from an image via a JSON body.  The body should be of the f
 
 
 ## GET /search/images
+
+
+## POST /tokenize
+
+Counts tokens for a string using either the `llama3` or `clip` tokenizer.
+
+Request body:
+
+```json
+{
+	"text": "Hello world",
+	"tokenizer": "llama3"
+}
+```
+
+Response body:
+
+```json
+{
+	"n_tokens": 2
+}
+```
 
 
 ## POST /upload_image

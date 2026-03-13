@@ -6,6 +6,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tagstormdb::{Database, LoginKey};
+use tokenizers::Tokenizer;
 use tokio::{
 	io::{AsyncBufReadExt, BufReader},
 	process::Command,
@@ -427,6 +428,45 @@ async fn test_api_access_controls() {
 	)
 	.await;
 
+	set_user_scopes(&client, &admin_token, "").await;
+	test_tokenize_endpoint(
+		&client,
+		&user_token2,
+		"llama3",
+		"Hello world\nThis is a tokenizer test.",
+		expected_token_count("llama3-tokenizer.json", "Hello world\nThis is a tokenizer test."),
+	)
+	.await;
+	test_tokenize_endpoint(
+		&client,
+		&user_token2,
+		"clip",
+		"An image description with punctuation: cat, tree, sky.",
+		expected_token_count(
+			"tokenizer-clip-vit-large-patch14.json",
+			"An image description with punctuation: cat, tree, sky.",
+		),
+	)
+	.await;
+	call_api(
+		&client,
+		&user_token,
+		"tokenize",
+		Method::POST,
+		Some(&json!({"text": "hello", "tokenizer": "llama3"})),
+		StatusCode::UNAUTHORIZED,
+	)
+	.await;
+	call_api(
+		&client,
+		&user_token2,
+		"tokenize",
+		Method::POST,
+		Some(&json!({"text": "hello", "tokenizer": "invalid"})),
+		StatusCode::BAD_REQUEST,
+	)
+	.await;
+
 	// Terminate the server process
 	prediction_handle.stop(true).await;
 	server_process.kill().await.expect("Failed to kill server process");
@@ -464,6 +504,33 @@ async fn login(client: &Client, username: &str, login_key: &LoginKey) -> Option<
 	let user_token = login_json["token"].as_str().unwrap();
 
 	Some(user_token.to_string())
+}
+
+fn expected_token_count(tokenizer_file: &str, text: &str) -> usize {
+	let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(tokenizer_file);
+	let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer fixture");
+	tokenizer.encode(text, true).expect("Failed to tokenize fixture text").len()
+}
+
+async fn test_tokenize_endpoint(client: &Client, user_token: &str, tokenizer: &str, text: &str, expected_total_tokens: usize) {
+	let response = client
+		.post("http://127.0.0.1:7734/tokenize")
+		.bearer_auth(user_token)
+		.json(&json!({
+			"text": text,
+			"tokenizer": tokenizer,
+		}))
+		.send()
+		.await
+		.expect("Failed to send tokenize request");
+
+	assert_eq!(response.status(), StatusCode::OK, "Expected /tokenize to succeed");
+	let response_body: serde_json::Value = response.json().await.expect("Failed to decode tokenize response");
+	assert_eq!(
+		response_body["total_tokens"].as_u64(),
+		Some(expected_total_tokens as u64),
+		"Unexpected token count for tokenizer {tokenizer}"
+	);
 }
 
 async fn call_api(client: &Client, admin_token: &str, api: &str, method: Method, body: Option<&serde_json::Value>, expected_status: StatusCode) {

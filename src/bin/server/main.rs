@@ -46,6 +46,7 @@ use tagstormdb::{
 	AttributeKeyId, AttributeValueId, Database, ImageHash, ImageId, LoginKey, TagId, UserId, UserToken,
 };
 use task_queue::{task_queue_acquire, task_queue_delete, task_queue_finish, task_queue_insert, task_queue_view};
+use tokenizers::Tokenizer;
 use tokio::io::AsyncReadExt;
 
 
@@ -54,6 +55,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const TASK_EXPIRATION_TIME: i64 = 10 * 60; // 10 minutes
+const LLAMA3_TOKENIZER_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/llama3-tokenizer.json"));
+const CLIP_TOKENIZER_BYTES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tokenizer-clip-vit-large-patch14.json"));
 
 
 #[derive(Parser, Debug)]
@@ -120,6 +123,27 @@ struct ServerData {
 	prediction_server: Url,
 }
 
+struct ServerTokenizers {
+	llama3: Tokenizer,
+	clip: Tokenizer,
+}
+
+impl ServerTokenizers {
+	fn new() -> Result<Self, anyhow::Error> {
+		let llama3 = Tokenizer::from_bytes(LLAMA3_TOKENIZER_BYTES).map_err(|err| anyhow::anyhow!("Failed to initialize embedded llama3 tokenizer: {}", err))?;
+		let clip = Tokenizer::from_bytes(CLIP_TOKENIZER_BYTES).map_err(|err| anyhow::anyhow!("Failed to initialize embedded CLIP tokenizer: {}", err))?;
+
+		Ok(Self { llama3, clip })
+	}
+
+	fn get(&self, tokenizer: TokenizerKind) -> &Tokenizer {
+		match tokenizer {
+			TokenizerKind::Llama3 => &self.llama3,
+			TokenizerKind::Clip => &self.clip,
+		}
+	}
+}
+
 #[derive(Deserialize, Clone)]
 struct ServerSecrets {
 	#[serde(deserialize_with = "deserialize_hex")]
@@ -145,6 +169,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
 	// Load server secrets
 	let server_secrets = load_server_secrets(&args.secrets_path).await.context("Failed to load server secrets")?;
+
+	// Load tokenizers
+	let tokenizers = Arc::new(ServerTokenizers::new().context("Failed to load server tokenizers")?);
 
 	// Make sure default user scopes are valid
 	if parse_scopes(&args.default_user_scopes).is_err() {
@@ -174,7 +201,7 @@ async fn main() -> Result<(), anyhow::Error> {
 		prediction_server: args.prediction_server,
 	};
 
-	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone()))
+	let server = HttpServer::new(move || build_app(database.clone(), tag_mappings.clone(), server_data.clone(), tokenizers.clone()))
 		.bind((args.server_ip.as_str(), args.server_port))?
 		.run();
 
@@ -200,6 +227,7 @@ fn build_app(
 	db: Arc<Database>,
 	tag_mappings: TagMappings,
 	server_data: ServerData,
+	tokenizers: Arc<ServerTokenizers>,
 ) -> App<impl ServiceFactory<ServiceRequest, Config = (), Response = ServiceResponse<impl MessageBody>, Error = actix_web::Error, InitError = ()>> {
 	let logger = actix_web::middleware::Logger::default();
 	let cors = Cors::default()
@@ -220,6 +248,7 @@ fn build_app(
 		.app_data(Data::new(db))
 		.app_data(tag_mappings)
 		.app_data(Data::new(server_data))
+		.app_data(Data::new(tokenizers))
 		.app_data(temp_file_config)
 		.service(get_tag_mappings)
 		.service(list_tags)
@@ -242,6 +271,7 @@ fn build_app(
 		.service(list_user_tokens)
 		.service(change_user_scopes)
 		.service(search_images)
+		.service(count_tokens)
 		.service(upload_image)
 		.service(imgops_upload)
 		.service(create_user)
@@ -262,6 +292,43 @@ struct TagMetadata {
 	id: u64,
 	name: String,
 	active: bool,
+}
+
+#[derive(Debug, Copy, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenizerKind {
+	Llama3,
+	Clip,
+}
+
+#[derive(Deserialize)]
+struct CountTokensQuery {
+	text: String,
+	tokenizer: TokenizerKind,
+}
+
+#[derive(Serialize)]
+struct CountTokensResponse {
+	total_tokens: usize,
+}
+
+/// Count tokens for a piece of text using one of the configured tokenizers.
+#[actix_web::post("/tokenize")]
+async fn count_tokens(
+	tokenizers: Data<Arc<ServerTokenizers>>,
+	query: web::Json<CountTokensQuery>,
+	_user: AuthenticatedUser,
+) -> Result<HttpResponse, ServerError> {
+	let CountTokensQuery { text, tokenizer } = query.into_inner();
+	let tokenizer = tokenizers.get(tokenizer).clone();
+	let total_tokens = tokio::task::spawn_blocking(move || -> Result<usize, anyhow::Error> {
+		let encoding = tokenizer.encode(text, true).map_err(|err| anyhow::anyhow!("Tokenization failed: {}", err))?;
+		Ok(encoding.len())
+	})
+	.await
+	.context("Tokenization task failed")??;
+
+	Ok(HttpResponse::Ok().json(CountTokensResponse { total_tokens }))
 }
 
 
