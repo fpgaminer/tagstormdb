@@ -322,7 +322,7 @@ async fn count_tokens(
 	let CountTokensQuery { text, tokenizer } = query.into_inner();
 	let tokenizer = tokenizers.get(tokenizer).clone();
 	let total_tokens = tokio::task::spawn_blocking(move || -> Result<usize, anyhow::Error> {
-		let encoding = tokenizer.encode(text, true).map_err(|err| anyhow::anyhow!("Tokenization failed: {}", err))?;
+		let encoding = tokenizer.encode(text, false).map_err(|err| anyhow::anyhow!("Tokenization failed: {}", err))?;
 		Ok(encoding.len())
 	})
 	.await
