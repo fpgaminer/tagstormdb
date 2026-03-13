@@ -206,7 +206,7 @@ Response body:
 
 ```json
 {
-	"n_tokens": 2
+	"total_tokens": 2
 }
 ```
 

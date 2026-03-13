@@ -1,7 +1,7 @@
 # Build Rust API
 FROM rust:slim-bookworm AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev make
+RUN apt-get update && apt-get install -y pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/rust-api
 COPY src ./src
@@ -10,6 +10,8 @@ COPY tag_blacklist20231201.txt ./
 COPY tag_deprecations20231201.txt ./
 COPY tag_aliases000000000000.json ./
 COPY tag_implications000000000000.json ./
+COPY llama3-tokenizer.json ./
+COPY tokenizer-clip-vit-large-patch14.json ./
 
 RUN cargo install --path .
 

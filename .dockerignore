@@ -6,3 +6,5 @@
 !tag_blacklist20231201.txt
 !tag_deprecations20231201.txt
 !tag_implications000000000000.json
+!llama3-tokenizer.json
+!tokenizer-clip-vit-large-patch14.json
